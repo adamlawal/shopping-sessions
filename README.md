@@ -16,7 +16,7 @@ A native Rust pipeline that turns the click-stream CSVs in `/data` into the
 
 ## Open-source libraries used
 
-rayon, memmap2, memchr, ahash, parquet (Apache Arrow Rust). Test scripts and
+rayon, memmap2, memchr, ahash, parquet (Apache Arrow Rust), bytes, libc, mimalloc. Test scripts and
 fixtures come from the organizers' starter.
 
 ## License

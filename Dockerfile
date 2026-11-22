@@ -12,6 +12,8 @@ RUN touch src/main.rs && \
     ls -la target/release/shopping-sessions
 
 FROM debian:bookworm-slim
+# mimalloc backs the heap with 2 MB pages: far fewer page faults, cheap teardown at exit
+ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 COPY --from=build /src/target/release/shopping-sessions /app/pipeline
 USER 1000:1000
 CMD ["/app/pipeline"]

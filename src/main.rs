@@ -16,6 +16,9 @@
 
 use memmap2::Mmap;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
@@ -883,6 +886,18 @@ impl UserTable {
         let slots: Vec<Slot> = unsafe { std::mem::transmute(vec![[0u64; 2]; cap]) };
         UserTable { slots, shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
     }
+    /// Hint the CPU to start loading the slot a key will probe first.
+    #[inline(always)]
+    fn prefetch(&self, f: u64) {
+        let h = (f >> self.shift) as usize;
+        let p = unsafe { self.slots.as_ptr().add(h) } as *const i8;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = p;
+    }
     #[inline(always)]
     fn val(&self, h: usize) -> u32 {
         use std::sync::atomic::Ordering::Acquire;
@@ -1297,9 +1312,17 @@ fn main() {
         arena: &mut Vec<u8>,
     ) {
         let mut cd = [u32::MAX; BLK];
+        let mut fps = [0u64; BLK];
+        // pass 1: hash every user and prefetch its slot, so the misses overlap
         for (i, r) in rows.iter().enumerate() {
             if r.kind != K_INVALID {
-                cd[i] = utab.get_or_insert(fp(r.ukey), || {
+                fps[i] = fp(r.ukey);
+                utab.prefetch(fps[i]);
+            }
+        }
+        for (i, r) in rows.iter().enumerate() {
+            if r.kind != K_INVALID {
+                cd[i] = utab.get_or_insert(fps[i], || {
                     // a user seen for the first time and not linked: a person of their own
                     let pp = part_of(r.ukey);
                     let lid = counters[pp].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
