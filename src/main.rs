@@ -99,9 +99,44 @@ fn key128(b: &[u8]) -> u128 {
         };
         (lo as u128) | ((hi as u128) << 64) | ((l as u128) << 120)
     } else {
-        let h1 = hash_bytes(b, P1);
-        let h2 = hash_bytes(b, P3);
-        ((h1 as u128) << 64 | h2 as u128) | (1u128 << 127)
+        key_long(b)
+    }
+}
+
+/// 127-bit hash of an ID longer than 15 bytes (top bit set): two independent lanes in one
+/// pass over the bytes.
+#[inline(never)]
+fn key_long(b: &[u8]) -> u128 {
+    let l = b.len();
+    let mut h1 = P1 ^ (l as u64).wrapping_mul(P0);
+    let mut h2 = P3 ^ (l as u64).wrapping_mul(P2);
+    let mut i = 0;
+    while i + 8 <= l {
+        let w = ld8(b, i);
+        h1 = fold(h1 ^ w, P1);
+        h2 = fold(h2 ^ w, P0);
+        i += 8;
+    }
+    // the last 8 bytes again (overlapping), so every byte counts; l > 15 so this is in bounds
+    let w = ld8(b, l - 8);
+    h1 = fold(h1 ^ w, P2);
+    h2 = fold(h2 ^ w, P3);
+    let h1 = fold(h1, P3);
+    let h2 = fold(h2, P1);
+    ((h1 as u128) << 64 | h2 as u128) | (1u128 << 127)
+}
+
+/// key128 of a field that has at least 16 readable bytes from its start (`room`): the short
+/// form is one unaligned load, masked to the length.
+#[inline(always)]
+fn key128_room(b: &[u8], room: usize) -> u128 {
+    let l = b.len();
+    if l <= 15 && room >= 16 {
+        let x = unsafe { std::ptr::read_unaligned(b.as_ptr() as *const u128) };
+        let mask = (1u128 << (8 * l)) - 1;
+        (x & mask) | ((l as u128) << 120)
+    } else {
+        key128(b)
     }
 }
 
@@ -667,27 +702,136 @@ fn digits_in(x: u64, lanes: u64) -> bool {
     (x & hi) == want && (x.wrapping_add(0x0606_0606_0606_0606) & hi) == want
 }
 
+/// Days in month (y, m) for years 1970..2100, same index as MONTH_DAYS.
+static MONTH_LEN: [u8; 130 * 12] = {
+    let mut v = [0u8; 130 * 12];
+    let mut y = 1970u32;
+    while y < 2100 {
+        let mut m = 1u32;
+        while m <= 12 {
+            let d = match m {
+                2 => {
+                    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                        29
+                    } else {
+                        28
+                    }
+                }
+                4 | 6 | 9 | 11 => 30,
+                _ => 31,
+            };
+            v[((y - 1970) * 12 + m - 1) as usize] = d;
+            m += 1;
+        }
+        y += 1;
+    }
+    v
+};
+
+/// Branch-free check and value of `YYYY-MM-DDTHH:MM:SS` in v[0..19] (v.len() >= 20; byte 19
+/// is the caller's). Seconds since the epoch, or None if the shape or a value is bad, or the
+/// year is outside 1970..2100 (the caller then falls back to the general parser).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn ymdhms_fast(v: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    debug_assert!(v.len() >= 20);
+    unsafe {
+        // bytes 4..20: "-MM-DDTHH:MM:SS?"
+        let l = _mm_loadu_si128(v.as_ptr().add(4) as *const __m128i);
+        let tmpl = _mm_setr_epi8(b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, 0);
+        let sep_ok = _mm_movemask_epi8(_mm_cmpeq_epi8(l, tmpl)) as u32;
+        let d = _mm_sub_epi8(l, _mm_set1_epi8(b'0' as i8));
+        let dig_ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(d, _mm_set1_epi8(9)), _mm_set1_epi8(9))) as u32;
+        const SEP: u32 = 1 | 1 << 3 | 1 << 6 | 1 << 9 | 1 << 12;
+        const DIG: u32 = 0b0110_1101_1011_0110; // 1,2,4,5,7,8,10,11,13,14
+        // year: 4 digits at 0..4
+        let yw = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+        let yd = yw.wrapping_sub(0x3030_3030);
+        let y_ok = ((yw & 0xF0F0_F0F0) == 0x3030_3030) & ((yw.wrapping_add(0x0606_0606) & 0xF0F0_F0F0) == 0x3030_3030);
+        let y = (yd & 0xFF) * 1000 + ((yd >> 8) & 0xFF) * 100 + ((yd >> 16) & 0xFF) * 10 + (yd >> 24);
+        // pairs -> [mo, dd, hh, mi, ss] as i16
+        let sh = _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1);
+        let pr = _mm_shuffle_epi8(d, sh);
+        let w = _mm_maddubs_epi16(pr, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
+        // ranges: 1<=mo<=12, 1<=dd<=31, hh<=23, mi<=59, ss<=59
+        let hi = _mm_cmpgt_epi16(w, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0));
+        let lo = _mm_cmpgt_epi16(_mm_setr_epi16(1, 1, 0, 0, 0, 0, 0, 0), w);
+        let bad_rng = _mm_movemask_epi8(_mm_or_si128(hi, lo)) as u32;
+        let hms = _mm_madd_epi16(w, _mm_setr_epi16(0, 0, 3600, 60, 1, 0, 0, 0));
+        let mo = _mm_extract_epi16(w, 0) as u32;
+        let dd = _mm_extract_epi16(w, 1) as u32;
+        let t = _mm_extract_epi32(hms, 1) as i64 + _mm_extract_epi32(hms, 2) as i64;
+        let ok = (sep_ok & SEP) == SEP && (dig_ok & DIG) == DIG && y_ok && bad_rng == 0 && (1970..2100).contains(&y);
+        if !ok {
+            return None;
+        }
+        let idx = ((y - 1970) * 12 + mo - 1) as usize;
+        if dd > *MONTH_LEN.get_unchecked(idx) as u32 {
+            return None;
+        }
+        Some((*MONTH_DAYS.get_unchecked(idx) as i64 + dd as i64 - 1) * 86400 + t)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn ymdhms_fast(v: &[u8]) -> Option<i64> {
+    // portable: the general parser on a copy with a 'Z' zone, limited to the same years
+    let y = v[..4].iter().fold(0u32, |a, &c| a.wrapping_mul(10).wrapping_add(c.wrapping_sub(b'0') as u32));
+    if !(1970..2100).contains(&y) {
+        return None;
+    }
+    let mut t = [0u8; 20];
+    t[..19].copy_from_slice(&v[..19]);
+    t[19] = b'Z';
+    parse_ts(&t).map(|ms| ms / 1000)
+}
+
+/// F1 / F2 / F3 timestamp to epoch ms; None if bad. Same results as parse_ts, with
+/// branch-free fast paths for the three common shapes.
+#[inline(always)]
+fn parse_ts_fast(v: &[u8]) -> Option<i64> {
+    let l = v.len();
+    if l == 20 {
+        if v[19] == b'Z' {
+            if let Some(s) = ymdhms_fast(v) {
+                return Some(s * 1000);
+            }
+        }
+    } else if l == 25 {
+        let o = &v[19..25];
+        let sign = o[0];
+        let (oh1, oh2, om1, om2) = (o[1].wrapping_sub(b'0'), o[2].wrapping_sub(b'0'), o[4].wrapping_sub(b'0'), o[5].wrapping_sub(b'0'));
+        if (sign == b'+' || sign == b'-') && o[3] == b':' && oh1 < 10 && oh2 < 10 && om1 < 10 && om2 < 10 {
+            let oh = oh1 as i64 * 10 + oh2 as i64;
+            let om = om1 as i64 * 10 + om2 as i64;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            if let Some(s) = ymdhms_fast(v) {
+                let off = oh * 3600 + om * 60;
+                return Some(if sign == b'+' { s - off } else { s + off } * 1000);
+            }
+        }
+    } else if l == 13 {
+        let a = ld8(v, 0);
+        let b = ld8(v, 5);
+        if digits_in(a, u64::MAX) && digits_in(b, u64::MAX) {
+            return Some((parse8(a) * 100_000 + parse8(b) % 100_000) as i64);
+        }
+        return None;
+    }
+    parse_ts(v)
+}
+
 /// ingest_ts is always valid F1 (rules.md). Fast path for exactly that shape, with
 /// the full parser as the fallback for anything else, so the result never changes.
 #[inline(always)]
 fn parse_ingest(v: &[u8]) -> i64 {
-    if v.len() == 20 && v[19] == b'Z' && v[10] == b'T' {
-        let a = ld8(v, 0);
-        let b = ld8(v, 8);
-        if digits_in(a, 0x00FF_FF00_FFFF_FFFF) && digits_in(b, 0xFFFF_00FF_FF00_FFFF) {
-            let d = |x: u64, i: u32| ((x >> (8 * i)) as u32 & 0xFF) - 0x30;
-            let y = d(a, 0) * 1000 + d(a, 1) * 100 + d(a, 2) * 10 + d(a, 3);
-            let mo = d(a, 5) * 10 + d(a, 6);
-            let dd = d(b, 0) * 10 + d(b, 1);
-            let h = d(b, 3) * 10 + d(b, 4);
-            let mi = d(b, 6) * 10 + d(b, 7);
-            let (s1, s2) = (v[17].wrapping_sub(b'0') as u32, v[18].wrapping_sub(b'0') as u32);
-            if (1970..2100).contains(&y) && (1..=12).contains(&mo) && dd >= 1 && dd <= dim(y, mo) && h < 24 && mi < 60 && s1 < 6 && s2 < 10
-                && v[4] == b'-' && v[7] == b'-' && v[13] == b':' && v[16] == b':'
-            {
-                let days = MONTH_DAYS[((y - 1970) * 12 + mo - 1) as usize] as i64 + dd as i64 - 1;
-                return (days * 86400 + (h * 3600 + mi * 60 + s1 * 10 + s2) as i64) * 1000;
-            }
+    if v.len() == 20 && v[19] == b'Z' {
+        if let Some(s) = ymdhms_fast(v) {
+            return s * 1000;
         }
     }
     parse_ts(v).unwrap_or(i64::MAX)
@@ -1165,8 +1309,14 @@ impl Pool {
     }
 }
 
-/// Append-only record sink backed by pool blocks.
+/// Append-only record sink backed by pool blocks, with software write-combining: records
+/// gather in a cache-line buffer that lives in L1 and go out as whole 64-byte lines with
+/// non-temporal stores, so a worker writing 128 streams never reads a destination line
+/// in for ownership. T must divide 64 bytes.
+#[repr(C, align(64))]
 struct Sink<T: Copy> {
+    line: [u8; 64],
+    n: usize,
     cur: *mut T,
     end: *mut T,
     blocks: Vec<*mut T>,
@@ -1175,18 +1325,40 @@ unsafe impl<T: Copy> Send for Sink<T> {}
 unsafe impl<T: Copy> Sync for Sink<T> {}
 
 impl<T: Copy> Sink<T> {
+    const PER_LINE: usize = 64 / std::mem::size_of::<T>();
     fn new() -> Self {
-        Sink { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
+        assert!(64 % std::mem::size_of::<T>() == 0 && PBLK % 64 == 0);
+        Sink { line: [0; 64], n: 0, cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
     }
     #[inline(always)]
     fn push(&mut self, pool: &Pool, x: T) {
+        unsafe {
+            (self.line.as_mut_ptr() as *mut T).add(self.n).write(x);
+        }
+        self.n += 1;
+        if self.n == Self::PER_LINE {
+            self.emit(pool);
+        }
+    }
+    #[inline(always)]
+    fn emit(&mut self, pool: &Pool) {
         if self.cur == self.end {
             self.refill(pool);
         }
         unsafe {
-            self.cur.write(x);
-            self.cur = self.cur.add(1);
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                use std::arch::x86_64::*;
+                let s = self.line.as_ptr() as *const __m256i;
+                let d = self.cur as *mut __m256i;
+                _mm256_stream_si256(d, _mm256_load_si256(s));
+                _mm256_stream_si256(d.add(1), _mm256_load_si256(s.add(1)));
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            std::ptr::copy_nonoverlapping(self.line.as_ptr(), self.cur as *mut u8, 64);
+            self.cur = self.cur.add(Self::PER_LINE);
         }
+        self.n = 0;
     }
     #[inline(never)]
     fn refill(&mut self, pool: &Pool) {
@@ -1195,7 +1367,25 @@ impl<T: Copy> Sink<T> {
         self.cur = b;
         self.end = unsafe { b.add(PBLK / std::mem::size_of::<T>()) };
     }
+    /// Write out the partial line (plain stores) and make all stores visible.
+    fn finish(&mut self, pool: &Pool) {
+        if self.n > 0 {
+            if self.cur == self.end {
+                self.refill(pool);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.line.as_ptr() as *const T, self.cur, self.n);
+                self.cur = self.cur.add(self.n);
+            }
+            self.n = 0;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+    }
     fn slices(&self) -> Vec<&[T]> {
+        debug_assert!(self.n == 0);
         let per = PBLK / std::mem::size_of::<T>();
         let n = self.blocks.len();
         self.blocks
@@ -1650,6 +1840,8 @@ fn main() {
             let rows = &mut rows;
             let mut li: u32 = 0;
             let base = (ci as u32) << 20;
+            let cend = c.as_ptr() as usize + c.len();
+            let room = |x: &[u8]| cend - x.as_ptr() as usize;
             for_rows(c, |f: &[&[u8]; 7]| {
                 if f[0].is_empty() {
                     return;
@@ -1669,7 +1861,7 @@ fn main() {
                 let mut cat = 0u8;
                 let mut ukey = 0u128;
                 if !user.is_empty() && !f[5].is_empty() {
-                    if let Some(t) = parse_ts(f[2]) {
+                    if let Some(t) = parse_ts_fast(f[2]) {
                         if t >= ws && t < we && ingest_ms - t <= DAY_MS {
                             kind = match f[4] {
                                 b"view" | b"cart" => K_VALID,
@@ -1685,12 +1877,12 @@ fn main() {
                             };
                             if kind != K_INVALID {
                                 ts = (t - ws) as u32;
-                                ukey = key128(user);
+                                ukey = key128_room(user, room(user));
                             }
                         }
                     }
                 }
-                rows.push(Row { ukey, eid: key128(f[0]), user, ingest, ts, price, rowid, cat, kind });
+                rows.push(Row { ukey, eid: key128_room(f[0], room(f[0])), user, ingest, ts, price, rowid, cat, kind });
                 if rows.len() == BLK {
                     flush_rows(rows, utab, counters, pool, dparts, eparts, nparts, arena);
                 }
@@ -1720,6 +1912,12 @@ fn main() {
                     break;
                 }
                 parse_chunk(i, ev_chunks[i], &mut w);
+            }
+            for x in w.d.iter_mut() {
+                x.finish(pool);
+            }
+            for x in w.e.iter_mut() {
+                x.finish(pool);
             }
             w
         })
@@ -1795,7 +1993,7 @@ fn main() {
                     Some(&c) => c,
                     None => return,
                 };
-                let ts = match parse_ts(f[3]) {
+                let ts = match parse_ts_fast(f[3]) {
                     Some(t) if t >= cws && t < we => t,
                     _ => return,
                 };
@@ -2229,4 +2427,80 @@ fn write_campaign_daily(path: &Path, rows: &[(&[u8], &[u8], i32, CAgg)]) {
     col!(rg, Int64Type, &v, None);
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn n(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn ts_fast_matches_reference() {
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let alpha = b"0123456789-+:TZtz .e";
+        let seeds: [&[u8]; 8] = [
+            b"2026-10-03T23:58:10Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2028-02-29T00:00:00+12:00",
+            b"1970-01-01T00:00:00Z",
+            b"2099-12-31T23:59:59-00:00",
+            b"1791071890000",
+            b"2100-01-01T00:00:00Z",
+            b"1969-12-31T23:59:59+00:30",
+        ];
+        let mut n = 0;
+        for _ in 0..3_000_000 {
+            let mut v: Vec<u8> = seeds[(r.n() % 8) as usize].to_vec();
+            let k = r.n() % 4;
+            for _ in 0..k {
+                let i = (r.n() as usize) % v.len();
+                match r.n() % 4 {
+                    0 => v[i] = alpha[(r.n() as usize) % alpha.len()],
+                    1 => v[i] = b'0' + (r.n() % 10) as u8,
+                    2 => v[i] = (r.n() & 0xFF) as u8,
+                    _ => {
+                        if r.n() % 2 == 0 && v.len() > 1 {
+                            v.remove(i);
+                        } else {
+                            v.insert(i, b'0' + (r.n() % 10) as u8);
+                        }
+                    }
+                }
+            }
+            let a = parse_ts(&v);
+            let b = parse_ts_fast(&v);
+            assert_eq!(a, b, "{:?}", String::from_utf8_lossy(&v));
+            if v.len() == 20 && v[19] == b'Z' || v.len() == 20 {
+                assert_eq!(parse_ingest(&v), a.unwrap_or(i64::MAX), "{:?}", String::from_utf8_lossy(&v));
+            }
+            n += a.is_some() as usize;
+            // keys: the one-load form equals the general one
+            let mut buf = v.clone();
+            buf.extend_from_slice(b"0123456789abcdef");
+            assert_eq!(key128_room(&buf[..v.len()], buf.len()), key128(&v));
+        }
+        assert!(n > 100_000);
+        // every day of every month, both zones
+        for y in 1969..2101 {
+            for m in 0..14 {
+                for d in 0..33 {
+                    for &(h, mi, s) in &[(0, 0, 0), (23, 59, 59), (24, 0, 0), (12, 60, 0), (12, 0, 60)] {
+                        let f1 = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, h, mi, s);
+                        assert_eq!(parse_ts(f1.as_bytes()), parse_ts_fast(f1.as_bytes()), "{}", f1);
+                        let f2 = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+05:30", y, m, d, h, mi, s);
+                        assert_eq!(parse_ts(f2.as_bytes()), parse_ts_fast(f2.as_bytes()), "{}", f2);
+                    }
+                }
+            }
+        }
+    }
 }
