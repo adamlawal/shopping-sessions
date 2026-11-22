@@ -1778,7 +1778,7 @@ fn main() {
     for m in &ev_maps {
         chunks_of(m, &mut ev_chunks);
     }
-    assert!(ev_chunks.len() < 4096);
+    assert!(ev_chunks.len() < 4095); // keeps every rowid below the u32::MAX sentinel
     let products = &products;
     let utab = &utab;
     let counters = &counters[..];
@@ -2033,49 +2033,13 @@ fn main() {
         .map(|p| {
             let pt = Instant::now();
             let _guard = Defer(|| { let ns = pt.elapsed().as_nanos() as u64; pmax.fetch_max(ns, std::sync::atomic::Ordering::Relaxed); psum.fetch_add(ns, std::sync::atomic::Ordering::Relaxed); });
-            // rows to drop (later copies of a deduped event), as an open-addressing set
-            let nl: usize = losers.iter().map(|c| c[p].len()).sum();
-            let cap = (nl * 2 + 16).next_power_of_two();
-            let mask = cap - 1;
-            let mut set = vec![u32::MAX; cap];
-            for c in &losers {
-                for &r in &c[p] {
-                    let mut h = (r.wrapping_mul(0x9E37_79B1) >> 7) as usize & mask;
-                    while set[h] != u32::MAX && set[h] != r {
-                        h = (h + 1) & mask;
-                    }
-                    set[h] = r;
-                }
-            }
-            // a small bit filter in front of the set: almost every event is cleared by
-            // one L1 load and never probes the set
-            let fbits = (nl * 32 + 4096).next_power_of_two();
-            let fshift = 64 - fbits.trailing_zeros();
-            let mut filt = vec![0u64; fbits / 64];
-            for c in &losers {
-                for &r in &c[p] {
-                    let b = ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> fshift) as usize;
-                    filt[b >> 6] |= 1u64 << (b & 63);
-                }
-            }
-            let is_loser = |r: u32| -> bool {
-                let b = ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> fshift) as usize;
-                if filt[b >> 6] & (1u64 << (b & 63)) == 0 {
-                    return false;
-                }
-                let mut h = (r.wrapping_mul(0x9E37_79B1) >> 7) as usize & mask;
-                loop {
-                    let x = set[h];
-                    if x == u32::MAX {
-                        return false;
-                    }
-                    if x == r {
-                        return true;
-                    }
-                    h = (h + 1) & mask;
-                }
-            };
-
+            // rows to drop (later copies of a deduped event). This partition's events are
+            // stored in ascending rowid order (chunk order, then line order), so with the
+            // losers sorted, one moving pointer per pass answers "is this a loser?".
+            let mut lv: Vec<u32> = losers.iter().flat_map(|c| c[p].iter().copied()).collect();
+            lv.sort_unstable();
+            lv.push(u32::MAX); // sentinel
+            let nl = lv.len() - 1;
             // person-local ids are dense: group by counting sort, no hash tables
             let np = counters[p].load(std::sync::atomic::Ordering::Relaxed) as usize;
             let mut names: Vec<&[u8]> = link_names[p].clone();
@@ -2086,10 +2050,21 @@ fn main() {
                 }
             }
             let mut estart = vec![0u32; np + 1];
+            let mut k = 0usize;
             for c in &esl[p] {
+                // rowids ascend within a block (one worker fills it in order); start the
+                // pointer at the block's first rowid
+                if nl > 0 && !c.is_empty() {
+                    k = lv.partition_point(|&x| x < c[0].rowid);
+                }
                 for e in c.iter() {
-                    if nl > 0 && is_loser(e.rowid) {
-                        continue;
+                    if nl > 0 {
+                        while lv[k] < e.rowid {
+                            k += 1;
+                        }
+                        if lv[k] == e.rowid {
+                            continue;
+                        }
                     }
                     estart[e.lid as usize + 1] += 1;
                 }
@@ -2100,10 +2075,21 @@ fn main() {
             let total = estart[np] as usize;
             let mut packed: Vec<u64> = vec![0; total];
             let mut pos: Vec<u32> = estart[..np].to_vec();
+            let mut k = 0usize;
             for c in &esl[p] {
+                // rowids ascend within a block (one worker fills it in order); start the
+                // pointer at the block's first rowid
+                if nl > 0 && !c.is_empty() {
+                    k = lv.partition_point(|&x| x < c[0].rowid);
+                }
                 for e in c.iter() {
-                    if nl > 0 && is_loser(e.rowid) {
-                        continue;
+                    if nl > 0 {
+                        while lv[k] < e.rowid {
+                            k += 1;
+                        }
+                        if lv[k] == e.rowid {
+                            continue;
+                        }
                     }
                     let at = pos[e.lid as usize];
                     pos[e.lid as usize] = at + 1;
