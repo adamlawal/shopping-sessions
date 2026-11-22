@@ -74,7 +74,7 @@ fn ld4(b: &[u8], i: usize) -> u64 {
     u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as u64
 }
 
-#[inline]
+#[inline(always)]
 fn key128(b: &[u8]) -> u128 {
     let l = b.len();
     if l <= 15 {
@@ -154,7 +154,11 @@ fn map_file(p: &Path) -> Option<Mmap> {
     if len == 0 {
         return None;
     }
-    unsafe { Mmap::map(&f).ok() }
+    let mut o = memmap2::MmapOptions::new();
+    if std::env::var("SS_POP").is_ok() {
+        o.populate();
+    }
+    unsafe { o.map(&f).ok() }
 }
 
 /// Body of a CSV file (after the header line), split into newline-aligned chunks.
@@ -432,49 +436,32 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// F1 / F2 / F3 timestamp to epoch ms; None if bad. (Window checked by caller.)
-#[inline]
-fn parse_ts(v: &[u8]) -> Option<i64> {
-    let l = v.len();
-    if l == 0 {
-        return None;
-    }
-    if l != 20 && l != 25 || v[4] != b'-' {
-        // F3: digits only
-        let mut x: i64 = 0;
-        let mut sig = 0usize;
-        for &c in v {
-            let d = c.wrapping_sub(b'0');
-            if d >= 10 {
-                return None;
-            }
-            if sig > 0 || d != 0 {
-                sig += 1;
-            }
-            if sig <= 16 {
-                x = x * 10 + d as i64;
-            }
+/// Days from 1970-01-01 to the first of each month, years 1970..2100 (index (y-1970)*12 + m-1).
+static MONTH_DAYS: [i32; 130 * 12] = {
+    let mut v = [0i32; 130 * 12];
+    let mut y = 1970i64;
+    while y < 2100 {
+        let mut m = 1i64;
+        while m <= 12 {
+            // days_from_civil(y, m, 1), written out for const evaluation
+            let yy = if m <= 2 { y - 1 } else { y };
+            let era = yy / 400;
+            let yoe = yy - era * 400;
+            let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            v[((y - 1970) * 12 + m - 1) as usize] = (era * 146097 + doe - 719468) as i32;
+            m += 1;
         }
-        if sig > 15 {
-            return Some(i64::MAX); // valid form, far outside any window
-        }
-        return Some(x);
+        y += 1;
     }
-    if v[7] != b'-' || v[10] != b'T' || v[13] != b':' || v[16] != b':' {
-        return None;
-    }
-    let y = (d2(v, 0)? * 100 + d2(v, 2)?) as i64;
-    let mo = d2(v, 5)?;
-    let d = d2(v, 8)?;
-    let h = d2(v, 11)?;
-    let mi = d2(v, 14)?;
-    let s = d2(v, 17)?;
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d == 0 {
-        return None;
-    }
-    let dim = match mo {
+    v
+};
+
+#[inline(always)]
+fn dim(y: u32, m: u32) -> u32 {
+    match m {
         2 => {
-            if is_leap(y) {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
                 29
             } else {
                 28
@@ -482,33 +469,151 @@ fn parse_ts(v: &[u8]) -> Option<i64> {
         }
         4 | 6 | 9 | 11 => 30,
         _ => 31,
-    };
-    if d > dim {
+    }
+}
+
+/// 8 ASCII digits (already checked) little-endian in x -> value (first char most significant).
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    let x = x.wrapping_sub(0x3030_3030_3030_3030);
+    let x = (x.wrapping_mul(10)).wrapping_add(x >> 8) & 0x00FF_00FF_00FF_00FF;
+    let x = (x.wrapping_mul(100)).wrapping_add(x >> 16) & 0x0000_FFFF_0000_FFFF;
+    (x.wrapping_mul(10000)).wrapping_add(x >> 32) & 0xFFFF_FFFF
+}
+
+/// True if every byte of x selected by `lanes` (0xFF per lane) is an ASCII digit.
+#[inline(always)]
+fn digits_in(x: u64, lanes: u64) -> bool {
+    const HI: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    let hi = HI & lanes;
+    let want = 0x3030_3030_3030_3030 & lanes;
+    // high nibble 3, and adding 6 keeps it 3 (so the low nibble is 0..9); no carry leaves a byte
+    (x & hi) == want && (x.wrapping_add(0x0606_0606_0606_0606) & hi) == want
+}
+
+/// ingest_ts is always valid F1 (rules.md). Fast path for exactly that shape, with
+/// the full parser as the fallback for anything else, so the result never changes.
+#[inline(always)]
+fn parse_ingest(v: &[u8]) -> i64 {
+    if v.len() == 20 && v[19] == b'Z' && v[10] == b'T' {
+        let a = ld8(v, 0);
+        let b = ld8(v, 8);
+        if digits_in(a, 0x00FF_FF00_FFFF_FFFF) && digits_in(b, 0xFFFF_00FF_FF00_FFFF) {
+            let d = |x: u64, i: u32| ((x >> (8 * i)) as u32 & 0xFF) - 0x30;
+            let y = d(a, 0) * 1000 + d(a, 1) * 100 + d(a, 2) * 10 + d(a, 3);
+            let mo = d(a, 5) * 10 + d(a, 6);
+            let dd = d(b, 0) * 10 + d(b, 1);
+            let h = d(b, 3) * 10 + d(b, 4);
+            let mi = d(b, 6) * 10 + d(b, 7);
+            let (s1, s2) = (v[17].wrapping_sub(b'0') as u32, v[18].wrapping_sub(b'0') as u32);
+            if (1970..2100).contains(&y) && (1..=12).contains(&mo) && dd >= 1 && dd <= dim(y, mo) && h < 24 && mi < 60 && s1 < 6 && s2 < 10
+                && v[4] == b'-' && v[7] == b'-' && v[13] == b':' && v[16] == b':'
+            {
+                let days = MONTH_DAYS[((y - 1970) * 12 + mo - 1) as usize] as i64 + dd as i64 - 1;
+                return (days * 86400 + (h * 3600 + mi * 60 + s1 * 10 + s2) as i64) * 1000;
+            }
+        }
+    }
+    parse_ts(v).unwrap_or(i64::MAX)
+}
+
+/// F1 / F2 / F3 timestamp to epoch ms; None if bad. (Window checked by caller.)
+#[inline(always)]
+fn parse_ts(v: &[u8]) -> Option<i64> {
+    let l = v.len();
+    if (l == 20 || l == 25) && v[4] == b'-' {
+        // YYYY-MM-DDTHH:MM:SS then Z or +HH:MM / -HH:MM
+        let a = ld8(v, 0); // Y Y Y Y - M M -
+        let b = ld8(v, 8); // D D T H H : M M
+        let c = ld8(v, l - 8); // tail; for F1: ...M:SSZ ; we read seconds directly below
+        let _ = c;
+        // separators: a[4]='-' a[7]='-' b[2]='T' b[5]=':' v[16]=':'
+        const SEP_A: u64 = 0x2D00_0000_2D00_0000; // bytes 4 and 7 = '-'
+        const SEP_A_M: u64 = 0xFF00_00FF_0000_0000;
+        if a & SEP_A_M != (0x2D00_002D_0000_0000) {
+            let _ = SEP_A;
+            return None;
+        }
+        if (b >> 16) as u8 != b'T' || (b >> 40) as u8 != b':' || v[16] != b':' {
+            return None;
+        }
+        if !digits_in(a, 0x00FF_FF00_FFFF_FFFF) || !digits_in(b, 0xFFFF_00FF_FF00_FFFF) {
+            return None;
+        }
+        let (s1, s2) = (v[17].wrapping_sub(b'0'), v[18].wrapping_sub(b'0'));
+        if s1 > 5 || s2 > 9 {
+            return None;
+        }
+        let d = |x: u64, i: u32| ((x >> (8 * i)) as u32 & 0xFF) - 0x30;
+        let y = d(a, 0) * 1000 + d(a, 1) * 100 + d(a, 2) * 10 + d(a, 3);
+        let mo = d(a, 5) * 10 + d(a, 6);
+        let dd = d(b, 0) * 10 + d(b, 1);
+        let h = d(b, 3) * 10 + d(b, 4);
+        let mi = d(b, 6) * 10 + d(b, 7);
+        let sec = s1 as u32 * 10 + s2 as u32;
+        if !(1..=12).contains(&mo) || dd == 0 || h > 23 || mi > 59 || dd > dim(y, mo) {
+            return None;
+        }
+        let days = if (1970..2100).contains(&y) {
+            MONTH_DAYS[((y - 1970) * 12 + mo - 1) as usize] as i64 + dd as i64 - 1
+        } else {
+            days_from_civil(y as i64, mo, dd)
+        };
+        let mut secs = days * 86400 + (h * 3600 + mi * 60 + sec) as i64;
+        if l == 20 {
+            if v[19] != b'Z' {
+                return None;
+            }
+        } else {
+            let sign = v[19];
+            if (sign != b'+' && sign != b'-') || v[22] != b':' {
+                return None;
+            }
+            let oh = d2(v, 20)?;
+            let om = d2(v, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh * 3600 + om * 60) as i64;
+            if sign == b'+' {
+                secs -= off;
+            } else {
+                secs += off;
+            }
+        }
+        return Some(secs * 1000);
+    }
+    if l == 13 {
+        // the common F3 form: 13 digits, epoch ms
+        let a = ld8(v, 0);
+        let b = ld8(v, 5); // digits 5..12 (overlaps a by 3)
+        if digits_in(a, u64::MAX) && digits_in(b, u64::MAX) {
+            return Some((parse8(a) * 100_000 + parse8(b) % 100_000) as i64);
+        }
         return None;
     }
-    let mut secs = days_from_civil(y, mo, d) * 86400 + (h * 3600 + mi * 60 + s) as i64;
-    if l == 20 {
-        if v[19] != b'Z' {
+    if l == 0 {
+        return None;
+    }
+    // other F3 lengths: digits only, leading zeros allowed
+    let mut x: i64 = 0;
+    let mut sig = 0usize;
+    for &c in v {
+        let d = c.wrapping_sub(b'0');
+        if d >= 10 {
             return None;
         }
-    } else {
-        let sign = v[19];
-        if (sign != b'+' && sign != b'-') || v[22] != b':' {
-            return None;
+        if sig > 0 || d != 0 {
+            sig += 1;
         }
-        let oh = d2(v, 20)?;
-        let om = d2(v, 23)?;
-        if oh > 23 || om > 59 {
-            return None;
-        }
-        let off = (oh * 3600 + om * 60) as i64;
-        if sign == b'+' {
-            secs -= off;
-        } else {
-            secs += off;
+        if sig <= 16 {
+            x = x * 10 + d as i64;
         }
     }
-    Some(secs * 1000)
+    if sig > 15 {
+        return Some(i64::MAX); // valid form, far outside any window
+    }
+    Some(x)
 }
 
 #[inline]
@@ -762,9 +867,12 @@ impl UserTable {
     }
     #[inline(always)]
     fn get_or_insert(&self, f: u64, make: impl FnOnce() -> u32) -> u32 {
-        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
         let mut h = (f >> self.shift) as usize;
+        let mut probes = 0usize;
         loop {
+            probes += 1;
+            assert!(probes <= self.mask, "user table full");
             let k = self.keys[h].load(Acquire);
             if k == f {
                 return self.val(h);
@@ -774,8 +882,6 @@ impl UserTable {
                     Ok(_) => {
                         let v = make();
                         self.vals[h].store(v + 1, Release);
-                        let u = self.used.fetch_add(1, Relaxed);
-                        assert!(u * 10 < self.mask * 9, "user table full");
                         return v;
                     }
                     Err(cur) => {
@@ -794,6 +900,13 @@ const LID_BITS: u32 = 25;
 #[inline(always)]
 fn code(pp: usize, lid: u32) -> u32 {
     ((pp as u32) << LID_BITS) | lid
+}
+
+struct Defer<F: FnMut()>(F);
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
 }
 
 struct Persons<'a> {
@@ -854,10 +967,27 @@ fn main() {
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
     let verbose = std::env::var("SS_QUIET").is_err();
 
+    // CPU seconds used so far by the whole process (Linux: /proc/self/stat utime+stime)
+    fn cpu_now() -> f64 {
+        if let Ok(st) = std::fs::read_to_string("/proc/self/stat") {
+            if let Some(i) = st.rfind(')') {
+                let f: Vec<&str> = st[i + 2..].split(' ').collect();
+                if f.len() > 13 {
+                    let u: f64 = f[11].parse().unwrap_or(0.0);
+                    let s: f64 = f[12].parse().unwrap_or(0.0);
+                    return (u + s) / 100.0;
+                }
+            }
+        }
+        0.0
+    }
+    let cpu_last = std::cell::Cell::new(0.0f64);
     macro_rules! lap {
         ($s:expr) => {
             if verbose {
-                eprintln!("[{:>8.3}s] {}", t0.elapsed().as_secs_f64(), $s)
+                let c = cpu_now();
+                eprintln!("[{:>8.3}s cpu+{:.2}] {}", t0.elapsed().as_secs_f64(), c - cpu_last.get(), $s);
+                cpu_last.set(c);
             }
         };
     }
@@ -1126,7 +1256,7 @@ fn main() {
                 let rowid = base | li;
                 li += 1;
                 let user = f[1];
-                let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX);
+                let ingest_ms = parse_ingest(f[3]);
                 let ingest = if ingest_ms == i64::MAX {
                     i32::MAX
                 } else {
@@ -1216,7 +1346,7 @@ fn main() {
             out
         })
         .collect();
-    lap!(format!("user table: {} used of {}", utab.used.load(std::sync::atomic::Ordering::Relaxed), utab.mask + 1));
+    lap!(format!("user table: {} persons, {} slots", counters.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as usize).sum::<usize>(), utab.mask + 1));
     lap!("events deduped");
 
     // ---------------- clicks
@@ -1262,9 +1392,13 @@ fn main() {
         rows: Vec<URow<'a>>,
         camp: Vec<CAgg>,
     }
+    let pmax = std::sync::atomic::AtomicU64::new(0);
+    let psum = std::sync::atomic::AtomicU64::new(0);
     let results: Vec<PartOut> = (0..NPART)
         .into_par_iter()
         .map(|p| {
+            let pt = Instant::now();
+            let _guard = Defer(|| { let ns = pt.elapsed().as_nanos() as u64; pmax.fetch_max(ns, std::sync::atomic::Ordering::Relaxed); psum.fetch_add(ns, std::sync::atomic::Ordering::Relaxed); });
             // rows to drop (later copies of a deduped event), as an open-addressing set
             let nl: usize = losers.iter().map(|c| c[p].len()).sum();
             let cap = (nl * 2 + 16).next_power_of_two();
@@ -1492,7 +1626,7 @@ fn main() {
             PartOut { rows, camp }
         })
         .collect();
-    lap!("sessions");
+    lap!(format!("sessions (slowest partition {:.1} ms, mean {:.2} ms)", pmax.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, psum.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / NPART as f64));
 
     // ---------------- outputs
     let ud = out_dir.join("user_daily");
