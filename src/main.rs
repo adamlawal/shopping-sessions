@@ -1178,66 +1178,79 @@ fn main() {
     lap!("metadata");
 
     // ---------------- links
-    // 1. parse pairs (parallel), 2. shard every ID by key and give it a dense id
-    // (parallel per shard), 3. map pairs to dense ids (parallel), 4. union-find on
-    // plain u32 arrays (sequential, cache friendly), 5. name each person.
+    // Link IDs go straight into the shared user table, labelled with a dense link id
+    // (gid) while the links are parsed in parallel; union-find then runs on plain u32
+    // arrays, and one parallel pass over the table relabels every gid to its person code.
     let mut ln_chunks = Vec::new();
     for m in &ln_maps {
         chunks_of(m, &mut ln_chunks);
     }
-    let pairs: Vec<(Vec<(u128, u128)>, Vec<Vec<(u128, &[u8])>>)> = ln_chunks
+    let ln_bytes: usize = ln_maps.iter().map(|m| m.len()).sum();
+    let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
+    // every link line holds two IDs and is at least ~10 bytes long in practice
+    let utab = UserTable::new(ln_bytes / 5 + ev_bytes / 1200 + 1024);
+    let next_gid = std::sync::atomic::AtomicU32::new(0);
+    const GBLK: u32 = 1024;
+    type LinkOut<'a> = (Vec<(u32, u32)>, Vec<(u32, u128, &'a [u8])>);
+    let lparsed: Vec<LinkOut> = ln_chunks
         .par_iter()
         .map(|c| {
-            let mut v = Vec::with_capacity(c.len() / 20);
-            let mut sh: Vec<Vec<(u128, &[u8])>> = new_parts(c.len(), 10);
+            let mut edges = Vec::with_capacity(c.len() / 20);
+            let mut recs: Vec<(u32, u128, &[u8])> = Vec::with_capacity(c.len() / 20);
+            let (mut cur, mut end) = (0u32, 0u32);
+            // blocks of lines: hash and prefetch every slot first, then insert
+            let mut blk: Vec<(u128, u128, &[u8], &[u8], u64, u64)> = Vec::with_capacity(BLK);
+            macro_rules! flush {
+                () => {{
+                    for x in blk.iter() {
+                        utab.prefetch(x.4);
+                        utab.prefetch(x.5);
+                    }
+                    for &(ka, kb, a, b, fa, fb) in blk.iter() {
+                        let mut g = [0u32; 2];
+                        for (side, (k, nm, f)) in [(ka, a, fa), (kb, b, fb)].into_iter().enumerate() {
+                            g[side] = utab.get_or_insert(f, || {
+                                if cur == end {
+                                    cur = next_gid.fetch_add(GBLK, std::sync::atomic::Ordering::Relaxed);
+                                    end = cur + GBLK;
+                                }
+                                let id = cur;
+                                cur += 1;
+                                recs.push((id, k, nm));
+                                id
+                            });
+                        }
+                        edges.push((g[0], g[1]));
+                    }
+                    blk.clear();
+                }};
+            }
             for_rows(c, |f: &[&[u8]; 2]| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    let (ka, kb) = (key128(f[0]), key128(f[1]));
-                    v.push((ka, kb));
-                    sh[part_of(ka)].push((ka, f[0]));
-                    sh[part_of(kb)].push((kb, f[1]));
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
+                }
+                let (ka, kb) = (key128(f[0]), key128(f[1]));
+                blk.push((ka, kb, f[0], f[1], fp(ka), fp(kb)));
+                if blk.len() == BLK {
+                    flush!();
                 }
             });
-            (v, sh)
+            flush!();
+            (edges, recs)
         })
         .collect();
-    struct Shard<'a> {
-        tab: LinkTable,
-        keys: Vec<u128>,
-        names: Vec<&'a [u8]>,
+    let n_ids = next_gid.load(std::sync::atomic::Ordering::Relaxed) as usize; // incl. unused gaps
+    let mut names: Vec<&[u8]> = vec![&[][..]; n_ids];
+    let mut keys: Vec<u128> = vec![0; n_ids];
+    for c in &lparsed {
+        for &(g, k, nm) in &c.1 {
+            names[g as usize] = nm;
+            keys[g as usize] = k;
+        }
     }
-    let shards: Vec<Shard> = (0..NPART)
-        .into_par_iter()
-        .map(|s| {
-            let n: usize = pairs.iter().map(|c| c.1[s].len()).sum();
-            let mut tab = LinkTable::with_capacity(n);
-            let mut keys = Vec::with_capacity(n / 2 + 16);
-            let mut names = Vec::with_capacity(n / 2 + 16);
-            for c in &pairs {
-                for &(k, nm) in &c.1[s] {
-                    tab.get_or_insert(k, || {
-                        keys.push(k);
-                        names.push(nm);
-                        (keys.len() - 1) as u32
-                    });
-                }
-            }
-            Shard { tab, keys, names }
-        })
-        .collect();
-    let mut offs = vec![0u32; NPART + 1];
-    for s in 0..NPART {
-        offs[s + 1] = offs[s] + shards[s].keys.len() as u32;
-    }
-    let n_ids = offs[NPART] as usize;
-    let gid = |k: u128| -> u32 {
-        let s = part_of(k);
-        offs[s] + shards[s].tab.get(k)
-    };
-    let edges: Vec<Vec<(u32, u32)>> = pairs.par_iter().map(|c| c.0.iter().map(|&(a, b)| (gid(a), gid(b))).collect()).collect();
     let mut parent: Vec<u32> = (0..n_ids as u32).collect();
-    for v in &edges {
-        for &(a, b) in v {
+    for c in &lparsed {
+        for &(a, b) in &c.0 {
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
             if ra != rb {
@@ -1249,8 +1262,7 @@ fn main() {
     for g in 0..n_ids as u32 {
         root[g as usize] = find(&mut parent, g);
     }
-    // per root: (smallest name, its key); names are never empty, so empty = unset.
-    // Parallel: thread t owns the roots r with r % T == t, so writes never collide.
+    // per root: (smallest name, its key). Thread t owns roots r with r % T == t.
     let mut best: Vec<(&[u8], u128)> = vec![(&[][..], 0); n_ids];
     {
         struct Ptr<T>(*mut T);
@@ -1258,30 +1270,29 @@ fn main() {
         unsafe impl<T> Send for Ptr<T> {}
         let bp = Ptr(best.as_mut_ptr());
         let nt = ncpu.max(1);
-        let (root, shards, bp) = (&root, &shards, &bp);
+        let (root, names, keys, bp) = (&root, &names, &keys, &bp);
         (0..nt).into_par_iter().for_each(|t| {
-            let mut g = 0usize;
-            for sh in shards.iter() {
-                for (l, &nm) in sh.names.iter().enumerate() {
-                    let r = root[g] as usize;
-                    if r % nt == t {
-                        let b = unsafe { &mut *bp.0.add(r) };
-                        if b.0.is_empty() || nm < b.0 {
-                            *b = (nm, sh.keys[l]);
-                        }
+            for g in 0..n_ids {
+                let nm = names[g];
+                if nm.is_empty() {
+                    continue; // an unused gid
+                }
+                let r = root[g] as usize;
+                if r % nt == t {
+                    let b = unsafe { &mut *bp.0.add(r) };
+                    if b.0.is_empty() || nm < b.0 {
+                        *b = (nm, keys[g]);
                     }
-                    g += 1;
                 }
             }
         });
     }
-
     // every person gets (partition, local id); linked persons first, in root order
     let counters: Vec<std::sync::atomic::AtomicU32> = (0..NPART).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
     let mut link_names: Vec<Vec<&[u8]>> = (0..NPART).map(|_| Vec::new()).collect();
     let mut root_code: Vec<u32> = vec![u32::MAX; n_ids];
     {
-        let roots: Vec<u32> = (0..n_ids as u32).into_par_iter().filter(|&g| root[g as usize] == g).collect();
+        let roots: Vec<u32> = (0..n_ids as u32).into_par_iter().filter(|&g| root[g as usize] == g && !names[g as usize].is_empty()).collect();
         let pps: Vec<u8> = roots.par_iter().map(|&r| part_of(best[r as usize].1) as u8).collect();
         for (&r, &pp) in roots.iter().zip(pps.iter()) {
             let pp = pp as usize;
@@ -1293,13 +1304,14 @@ fn main() {
     for pp in 0..NPART {
         counters[pp].store(link_names[pp].len() as u32, std::sync::atomic::Ordering::Relaxed);
     }
-    let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
-    let utab = UserTable::new(n_ids + ev_bytes / 1200 + 1024);
-    (0..NPART).into_par_iter().for_each(|s| {
-        for (l, &k) in shards[s].keys.iter().enumerate() {
-            let g = offs[s] as usize + l;
-            let c = root_code[root[g] as usize];
-            utab.get_or_insert(fp(k), || c);
+    // relabel: every slot filled so far holds a gid; give it its person's code
+    utab.slots.par_chunks(1 << 14).for_each(|sl| {
+        for slot in sl {
+            let v = slot.val.load(std::sync::atomic::Ordering::Relaxed);
+            if v != 0 {
+                let g = (v - 1) as usize;
+                slot.val.store(root_code[root[g] as usize] + 1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     });
     lap!(format!("links: {} ids", n_ids));
