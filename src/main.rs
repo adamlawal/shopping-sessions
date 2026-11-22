@@ -1249,33 +1249,45 @@ fn main() {
     for g in 0..n_ids as u32 {
         root[g as usize] = find(&mut parent, g);
     }
-    // per root: (smallest name, its key); names are never empty, so empty = unset
+    // per root: (smallest name, its key); names are never empty, so empty = unset.
+    // Parallel: thread t owns the roots r with r % T == t, so writes never collide.
     let mut best: Vec<(&[u8], u128)> = vec![(&[][..], 0); n_ids];
     {
-        let mut g = 0usize;
-        for sh in &shards {
-            for (l, &nm) in sh.names.iter().enumerate() {
-                let b = &mut best[root[g] as usize];
-                if b.0.is_empty() || nm < b.0 {
-                    *b = (nm, sh.keys[l]);
+        struct Ptr<T>(*mut T);
+        unsafe impl<T> Sync for Ptr<T> {}
+        unsafe impl<T> Send for Ptr<T> {}
+        let bp = Ptr(best.as_mut_ptr());
+        let nt = ncpu.max(1);
+        let (root, shards, bp) = (&root, &shards, &bp);
+        (0..nt).into_par_iter().for_each(|t| {
+            let mut g = 0usize;
+            for sh in shards.iter() {
+                for (l, &nm) in sh.names.iter().enumerate() {
+                    let r = root[g] as usize;
+                    if r % nt == t {
+                        let b = unsafe { &mut *bp.0.add(r) };
+                        if b.0.is_empty() || nm < b.0 {
+                            *b = (nm, sh.keys[l]);
+                        }
+                    }
+                    g += 1;
                 }
-                g += 1;
             }
-        }
+        });
     }
 
     // every person gets (partition, local id); linked persons first, in root order
     let counters: Vec<std::sync::atomic::AtomicU32> = (0..NPART).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
     let mut link_names: Vec<Vec<&[u8]>> = (0..NPART).map(|_| Vec::new()).collect();
     let mut root_code: Vec<u32> = vec![u32::MAX; n_ids];
-    for g in 0..n_ids {
-        let r = root[g] as usize;
-        if root_code[r] == u32::MAX {
-            let (nm, k) = best[r];
-            let pp = part_of(k);
+    {
+        let roots: Vec<u32> = (0..n_ids as u32).into_par_iter().filter(|&g| root[g as usize] == g).collect();
+        let pps: Vec<u8> = roots.par_iter().map(|&r| part_of(best[r as usize].1) as u8).collect();
+        for (&r, &pp) in roots.iter().zip(pps.iter()) {
+            let pp = pp as usize;
             let lid = link_names[pp].len() as u32;
-            link_names[pp].push(nm);
-            root_code[r] = code(pp, lid);
+            link_names[pp].push(best[r as usize].0);
+            root_code[r as usize] = code(pp, lid);
         }
     }
     for pp in 0..NPART {
@@ -1502,6 +1514,13 @@ fn main() {
         rows: Vec<URow<'a>>,
         camp: Vec<CAgg>,
     }
+    // each partition writes its own user_daily file as soon as its sessions are done
+    let ud = out_dir.join("user_daily");
+    let cd = out_dir.join("campaign_daily");
+    std::fs::create_dir_all(&ud).unwrap();
+    std::fs::create_dir_all(&cd).unwrap();
+    let urows_written = std::sync::atomic::AtomicUsize::new(0);
+    let (ud_ref, cat_names_ref) = (&ud, &cat_names);
     let pmax = std::sync::atomic::AtomicU64::new(0);
     let psum = std::sync::atomic::AtomicU64::new(0);
     let results: Vec<PartOut> = (0..NPART)
@@ -1523,7 +1542,22 @@ fn main() {
                     set[h] = r;
                 }
             }
+            // a small bit filter in front of the set: almost every event is cleared by
+            // one L1 load and never probes the set
+            let fbits = (nl * 32 + 4096).next_power_of_two();
+            let fshift = 64 - fbits.trailing_zeros();
+            let mut filt = vec![0u64; fbits / 64];
+            for c in &losers {
+                for &r in &c[p] {
+                    let b = ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> fshift) as usize;
+                    filt[b >> 6] |= 1u64 << (b & 63);
+                }
+            }
             let is_loser = |r: u32| -> bool {
+                let b = ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> fshift) as usize;
+                if filt[b >> 6] & (1u64 << (b & 63)) == 0 {
+                    return false;
+                }
                 let mut h = (r.wrapping_mul(0x9E37_79B1) >> 7) as usize & mask;
                 loop {
                     let x = set[h];
@@ -1733,32 +1767,22 @@ fn main() {
                 }
                 active.clear();
             }
-            PartOut { rows, camp }
+            if !rows.is_empty() {
+                let refs: Vec<&URow> = rows.iter().collect();
+                write_user_daily(&ud_ref.join(format!("part-{p:03}.parquet")), &refs, cat_names_ref);
+                urows_written.fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            PartOut { rows: Vec::new(), camp }
         })
         .collect();
     lap!(format!("sessions (slowest partition {:.1} ms, mean {:.2} ms)", pmax.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, psum.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / NPART as f64));
 
     // ---------------- outputs
-    let ud = out_dir.join("user_daily");
-    let cd = out_dir.join("campaign_daily");
-    std::fs::create_dir_all(&ud).unwrap();
-    std::fs::create_dir_all(&cd).unwrap();
-
-    let nfiles = ncpu.max(1);
-    let per = results.len().div_ceil(nfiles);
-    let groups: Vec<&[PartOut]> = results.chunks(per.max(1)).collect();
-    let cat_names = &cat_names;
+    if urows_written.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        // no rows at all: still write one (empty) file with the schema
+        write_user_daily(&ud.join("part-000.parquet"), &[], &cat_names);
+    }
     rayon::scope(|s| {
-        for (gi, g) in groups.iter().enumerate() {
-            let ud = &ud;
-            s.spawn(move |_| {
-                let rows: Vec<&URow> = g.iter().flat_map(|p| p.rows.iter()).collect();
-                if rows.is_empty() && gi != 0 {
-                    return;
-                }
-                write_user_daily(&ud.join(format!("part-{gi:03}.parquet")), &rows, cat_names);
-            });
-        }
         let results = &results;
         let cd = &cd;
         let camp_ids = &camp_ids;
