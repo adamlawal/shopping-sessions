@@ -164,6 +164,28 @@ fn release(c: &[u8]) {
     let _ = c;
 }
 
+/// Map items to results in parallel; workers claim items in index order from a counter.
+fn ordered_map<T: Sync, R: Send>(items: &[T], nthreads: usize, f: impl Fn(usize, &T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut parts: Vec<Vec<(usize, R)>> = (0..nthreads.max(1))
+        .into_par_iter()
+        .map(|_| {
+            let mut out = Vec::new();
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                out.push((i, f(i, &items[i])));
+            }
+            out
+        })
+        .collect();
+    let mut all: Vec<(usize, R)> = parts.drain(..).flatten().collect();
+    all.sort_unstable_by_key(|x| x.0);
+    all.into_iter().map(|x| x.1).collect()
+}
+
 fn map_file(p: &Path) -> Option<Mmap> {
     let f = File::open(p).ok()?;
     let len = f.metadata().ok()?.len();
@@ -1037,6 +1059,43 @@ fn main() {
     let ev_maps: Vec<Mmap> = list_csv(&data_dir.join("events")).par_iter().filter_map(|p| map_file(p)).collect();
     let cl_maps: Vec<Mmap> = list_csv(&data_dir.join("clicks")).par_iter().filter_map(|p| map_file(p)).collect();
     let ln_maps: Vec<Mmap> = list_csv(&data_dir.join("links")).par_iter().filter_map(|p| map_file(p)).collect();
+    // Ask the kernel to start reading every input file now, asynchronously and with many
+    // requests in flight, so a cold page cache is filled while we parse links and metadata
+    // instead of each worker stalling on small synchronous faults later.
+    if std::env::var("SS_NOPF").is_err() {
+        let regions: Vec<(usize, usize)> = ln_maps
+            .iter()
+            .chain(ev_maps.iter())
+            .chain(cl_maps.iter())
+            .map(|m| (m.as_ptr() as usize, m.len()))
+            .collect();
+        // split into ~8 MB pieces, issued in order by 4 threads
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (p, l) in regions {
+            let mut o = 0;
+            while o < l {
+                let n = (l - o).min(8 << 20);
+                pieces.push((p + o, n));
+                o += n;
+            }
+        }
+        let pieces = std::sync::Arc::new(pieces);
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..4 {
+            let (pieces, next) = (pieces.clone(), next.clone());
+            std::thread::spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= pieces.len() {
+                    break;
+                }
+                let (p, l) = pieces[i];
+                let a = p & !4095;
+                unsafe {
+                    libc::madvise(a as *mut libc::c_void, l + (p - a), libc::MADV_WILLNEED);
+                }
+            });
+        }
+    }
     let prod_map = map_file(&data_dir.join("products.csv"));
     let camp_map = map_file(&data_dir.join("campaigns.csv"));
 
@@ -1264,10 +1323,7 @@ fn main() {
         rows.clear();
     }
     type EvOut = (Vec<Vec<D>>, Vec<Vec<Ev>>, Vec<Vec<(u32, u32, u32)>>, Vec<u8>);
-    let ev_parsed: Vec<EvOut> = ev_chunks
-        .par_iter()
-        .enumerate()
-        .map(|(ci, c)| {
+    let parse_chunk = |ci: usize, c: &&[u8]| -> EvOut {
             let mut dparts: Vec<Vec<D>> = new_parts(c.len(), 70);
             let mut eparts: Vec<Vec<Ev>> = new_parts(c.len(), 70);
             let mut nparts: Vec<Vec<(u32, u32, u32)>> = (0..NPART).map(|_| Vec::new()).collect();
@@ -1326,8 +1382,10 @@ fn main() {
             // in parallel, instead of in the single-threaded teardown at exit
             release(c);
             (dparts, eparts, nparts, arena)
-        })
-        .collect();
+        };
+    // Workers take chunks in file order from a shared counter: together they read the
+    // input front to back, right behind the kernel's prefetch, and stay load-balanced.
+    let ev_parsed: Vec<EvOut> = ordered_map(&ev_chunks, ncpu, parse_chunk);
     lap!(format!("events parsed: {} chunks", ev_chunks.len()));
 
     // ---------------- events: dedup on the small records -> per person partition, rows to drop
