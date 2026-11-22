@@ -1,0 +1,9 @@
+target/
+generator/target/
+dev/
+out/
+.venv/
+starter-duckdb/
+__pycache__/
+dev-answer/
+generator/
