@@ -1798,8 +1798,7 @@ fn main() {
         // pass 1: hash every user and prefetch its slot, so the misses overlap
         for (i, r) in rows.iter().enumerate() {
             if r.kind != K_INVALID {
-                fps[i] = fp(r.ukey);
-                utab.prefetch(fps[i]);
+                fps[i] = fp(r.ukey); // its slot was prefetched when the row was parsed
             }
         }
         for (i, r) in rows.iter().enumerate() {
@@ -1878,6 +1877,9 @@ fn main() {
                             if kind != K_INVALID {
                                 ts = (t - ws) as u32;
                                 ukey = key128_room(user, room(user));
+                                // start loading the user's slot now: it is needed when this
+                                // block of rows is flushed, up to BLK rows later
+                                utab.prefetch(fp(ukey));
                             }
                         }
                     }
