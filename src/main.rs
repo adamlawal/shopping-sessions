@@ -99,9 +99,44 @@ fn key128(b: &[u8]) -> u128 {
         };
         (lo as u128) | ((hi as u128) << 64) | ((l as u128) << 120)
     } else {
-        let h1 = hash_bytes(b, P1);
-        let h2 = hash_bytes(b, P3);
-        ((h1 as u128) << 64 | h2 as u128) | (1u128 << 127)
+        key_long(b)
+    }
+}
+
+/// 127-bit hash of an ID longer than 15 bytes (top bit set): two independent lanes in one
+/// pass over the bytes.
+#[inline(never)]
+fn key_long(b: &[u8]) -> u128 {
+    let l = b.len();
+    let mut h1 = P1 ^ (l as u64).wrapping_mul(P0);
+    let mut h2 = P3 ^ (l as u64).wrapping_mul(P2);
+    let mut i = 0;
+    while i + 8 <= l {
+        let w = ld8(b, i);
+        h1 = fold(h1 ^ w, P1);
+        h2 = fold(h2 ^ w, P0);
+        i += 8;
+    }
+    // the last 8 bytes again (overlapping), so every byte counts; l > 15 so this is in bounds
+    let w = ld8(b, l - 8);
+    h1 = fold(h1 ^ w, P2);
+    h2 = fold(h2 ^ w, P3);
+    let h1 = fold(h1, P3);
+    let h2 = fold(h2, P1);
+    ((h1 as u128) << 64 | h2 as u128) | (1u128 << 127)
+}
+
+/// key128 of a field that has at least 16 readable bytes from its start (`room`): the short
+/// form is one unaligned load, masked to the length.
+#[inline(always)]
+fn key128_room(b: &[u8], room: usize) -> u128 {
+    let l = b.len();
+    if l <= 15 && room >= 16 {
+        let x = unsafe { std::ptr::read_unaligned(b.as_ptr() as *const u128) };
+        let mask = (1u128 << (8 * l)) - 1;
+        (x & mask) | ((l as u128) << 120)
+    } else {
+        key128(b)
     }
 }
 
@@ -165,28 +200,6 @@ fn release(c: &[u8]) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = c;
-}
-
-/// Map items to results in parallel; workers claim items in index order from a counter.
-fn ordered_map<T: Sync, R: Send>(items: &[T], nthreads: usize, f: impl Fn(usize, &T) -> R + Sync) -> Vec<R> {
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut parts: Vec<Vec<(usize, R)>> = (0..nthreads.max(1))
-        .into_par_iter()
-        .map(|_| {
-            let mut out = Vec::new();
-            loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= items.len() {
-                    break;
-                }
-                out.push((i, f(i, &items[i])));
-            }
-            out
-        })
-        .collect();
-    let mut all: Vec<(usize, R)> = parts.drain(..).flatten().collect();
-    all.sort_unstable_by_key(|x| x.0);
-    all.into_iter().map(|x| x.1).collect()
 }
 
 fn map_file(p: &Path) -> Option<Mmap> {
@@ -371,81 +384,238 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (c, n, q)
 }
 
-/// Tokenize a whole chunk in one pass: for every well-formed line with exactly N
-/// fields, call f with the unquoted fields. Malformed and empty lines are skipped.
-/// A line's quotes are valid exactly when every quote is part of a field wrapped
-/// in quotes, i.e. when the line's quote count is twice the number of wrapped fields.
+/// Low `n` bits of x (all of x when n >= 64): BMI2 bzhi on x86.
 #[inline(always)]
-fn for_rows<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
-    let len = chunk.len();
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut n = 0usize;
-    let mut field_start = 0usize;
-    let mut q_total = 0u32; // quotes before the current block
-    let mut q_line = 0u32; // running quote count at line start
+fn low_bits(x: u64, n: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_bzhi_u64(x, n)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        if n >= 64 { x } else { x & ((1u64 << n) - 1) }
+    }
+}
 
-    #[inline(always)]
-    fn finish<'a, const N: usize>(fields: &mut [&'a [u8]; N], nq: u32) -> bool {
-        if nq == 0 {
-            return true;
+/// Separator entry: bit 31 = newline, bits 0..31 = its position in the chunk.
+const E_NL: u32 = 1 << 31;
+const WIN_BLOCKS: usize = 64;
+/// Software prefetch distance for the input scan, in bytes.
+const PF_DIST: usize = 8192;
+
+/// Reused per-thread scratch for for_rows: separator entries of the current window, and
+/// per 64-byte block of the chunk its quote mask and the quotes before it.
+#[derive(Default)]
+struct Scratch {
+    ent: Vec<u32>,
+    qm: Vec<u64>,
+    qp: Vec<u32>,
+}
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// Newline flags (bit 31) of 8 consecutive entries at e, as 8 bits. The entry buffer
+/// always has slack capacity after its last entry, so reading 8 is in bounds.
+#[inline(always)]
+unsafe fn nl_flags8(e: *const u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_loadu_si256(e as *const __m256i))) as u32
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    unsafe {
+        let mut m = 0u32;
+        for j in 0..8 {
+            m |= (*e.add(j) >> 31) << j;
         }
-        let mut wrapped = 0u32;
-        for v in fields.iter_mut() {
-            let raw = *v;
-            let l = raw.len();
-            if l >= 2 && raw[0] == b'"' && raw[l - 1] == b'"' {
-                wrapped += 2;
-                *v = &raw[1..l - 1];
-            }
-        }
-        wrapped == nq
+        m
+    }
+}
+
+/// Tokenize a whole chunk in one pass over its bytes: for every well-formed line with
+/// exactly N fields, call f with the unquoted fields. Malformed and empty lines are skipped.
+///
+/// Each 64-byte block gives bit masks of commas, newlines and quotes. The set separator
+/// bits are written out without branches (position + newline flag) into a small buffer
+/// that stays in L1, and rows are then cut from it N separators at a time: a row is
+/// well-shaped when exactly its N-th separator is a newline. A line's quotes are valid
+/// exactly when every quote is part of a field wrapped in quotes, i.e. when the line's
+/// quote count (from the per-block quote masks) is twice the number of wrapped fields.
+#[inline(always)]
+fn for_rows<'a, const N: usize>(chunk: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        for_rows_in(chunk, &mut s, f)
+    })
+}
+
+#[inline(always)]
+fn for_rows_in<'a, const N: usize>(chunk: &'a [u8], sc: &mut Scratch, mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = chunk.len();
+    assert!(len < (1usize << 31) - 64);
+    let nblk = len / 64 + 2;
+    let Scratch { ent, qm, qp } = sc;
+    const ECAP: usize = WIN_BLOCKS * 64 + 256;
+    if ent.capacity() < ECAP {
+        // zero-filled once, so the 8-wide flag reads past the last entry see initialized memory
+        *ent = vec![0u32; ECAP];
+    }
+    ent.clear();
+    if qm.len() < nblk {
+        qm.resize(nblk, 0);
+        qp.resize(nblk, 0);
+    }
+    let qm = &mut qm[..];
+    let qp = &mut qp[..];
+    let mut line_start = 0usize; // first byte of the current line
+    let mut skipping = false; // inside a line with more than N fields: drop until its newline
+    let mut qtot = 0u32;
+    let mut tail = [0u8; 64];
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+
+    // quotes in the chunk before position p (p's block is already scanned)
+    macro_rules! qat {
+        ($p:expr) => {{
+            let p = $p;
+            unsafe { *qp.get_unchecked(p >> 6) + low_bits(*qm.get_unchecked(p >> 6), (p & 63) as u32).count_ones() }
+        }};
     }
 
-    let mut tail = [0u8; 64];
-    let mut base = 0usize;
-    while base < len {
-        let (cm, nl, qt) = if base + 64 <= len {
-            unsafe { masks64(chunk.as_ptr().add(base)) }
-        } else {
-            let r = len - base;
-            tail[..r].copy_from_slice(&chunk[base..]);
-            tail[r..].fill(0);
-            unsafe { masks64(tail.as_ptr()) }
-        };
-        let mut m = cm | nl;
-        while m != 0 {
-            let bit = m.trailing_zeros();
-            let pos = base + bit as usize;
-            if (nl >> bit) & 1 == 0 {
-                if n < N {
-                    fields[n] = unsafe { chunk.get_unchecked(field_start..pos) };
+    // Cut rows from ent; leftover separators of an unfinished line stay at the front.
+    macro_rules! cut {
+        () => {{
+            let n = ent.len();
+            let e = ent.as_ptr();
+            let mut k = 0usize;
+            if skipping {
+                while k < n && unsafe { *e.add(k) } & E_NL == 0 {
+                    k += 1;
                 }
-                n += 1;
-                field_start = pos + 1;
-            } else {
-                let q_here = q_total + (qt & ((1u64 << bit) - 1)).count_ones();
-                if n + 1 == N {
-                    fields[n] = unsafe { chunk.get_unchecked(field_start..pos) };
-                    if finish(&mut fields, q_here - q_line) {
+                if k < n {
+                    line_start = (unsafe { *e.add(k) } & !E_NL) as usize + 1;
+                    skipping = false;
+                    k += 1;
+                }
+            }
+            while !skipping && k + N <= n {
+                let nlb = unsafe { nl_flags8(e.add(k)) } & ((1u32 << N) - 1);
+                if nlb == 1 << (N - 1) {
+                    let mut s = line_start;
+                    let mut wrapped = 0u32;
+                    let mut p = 0usize;
+                    for j in 0..N {
+                        p = (unsafe { *e.add(k + j) } & !E_NL) as usize;
+                        let l = p - s;
+                        // branch-free: both end bytes are read even for short fields
+                        let c0 = unsafe { *chunk.get_unchecked(s.min(len - 1)) };
+                        let c1 = unsafe { *chunk.get_unchecked(p.max(1) - 1) };
+                        let w = ((l >= 2) & (c0 == b'"') & (c1 == b'"')) as usize;
+                        fields[j] = unsafe { chunk.get_unchecked(s + w..p - w) };
+                        wrapped += w as u32;
+                        s = p + 1;
+                    }
+                    let q = qat!(p) - qat!(line_start);
+                    if 2 * wrapped == q {
                         f(&fields);
                     }
+                    line_start = s;
+                    k += N;
+                } else if nlb != 0 {
+                    // a line with fewer than N fields (or empty): malformed
+                    let t = nlb.trailing_zeros() as usize;
+                    line_start = (unsafe { *e.add(k + t) } & !E_NL) as usize + 1;
+                    k += t + 1;
+                } else {
+                    // more than N fields
+                    k += N;
+                    while k < n && unsafe { *e.add(k) } & E_NL == 0 {
+                        k += 1;
+                    }
+                    if k < n {
+                        line_start = (unsafe { *e.add(k) } & !E_NL) as usize + 1;
+                        k += 1;
+                    } else {
+                        skipping = true;
+                    }
                 }
-                n = 0;
-                field_start = pos + 1;
-                q_line = q_here;
             }
-            m &= m - 1;
-        }
-        q_total += qt.count_ones();
-        base += 64;
+            if skipping {
+                ent.clear();
+            } else {
+                let rest = n - k;
+                unsafe { std::ptr::copy(e.add(k), ent.as_mut_ptr(), rest) };
+                unsafe { ent.set_len(rest) };
+            }
+        }};
     }
-    // final line without a trailing newline
-    if field_start < len && n + 1 == N {
-        fields[n] = &chunk[field_start..len];
-        if finish(&mut fields, q_total - q_line) {
-            f(&fields);
+
+    let mut base = 0usize;
+    while base < len {
+        let wend = (base + WIN_BLOCKS * 64).min(len);
+        // leftover < N entries + a window of at most 64 per block + 8 entries of slack
+        assert!(ent.len() + WIN_BLOCKS * 64 + 72 <= ent.capacity());
+        let mut n = ent.len();
+        let dst = ent.as_mut_ptr();
+        while base < wend {
+            let (cm, nl, qt) = if base + 64 <= len {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    // the hardware streamer stops at 4 KB pages: run ahead across them
+                    let pd = PF_DIST;
+                    if base + pd < len {
+                        std::arch::x86_64::_mm_prefetch(chunk.as_ptr().add(base + pd) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    }
+                }
+                unsafe { masks64(chunk.as_ptr().add(base)) }
+            } else {
+                let r = len - base;
+                tail[..r].copy_from_slice(&chunk[base..]);
+                tail[r..].fill(0);
+                unsafe { masks64(tail.as_ptr()) }
+            };
+            unsafe {
+                *qm.get_unchecked_mut(base >> 6) = qt;
+                *qp.get_unchecked_mut(base >> 6) = qtot;
+            }
+            qtot += qt.count_ones();
+            let mut m = cm | nl;
+            let cnt = m.count_ones() as usize;
+            let b32 = base as u32;
+            unsafe {
+                let d = dst.add(n);
+                let mut i = 0usize;
+                loop {
+                    for _ in 0..8 {
+                        let b = m.trailing_zeros();
+                        *d.add(i) = (b32 + b) | (((nl >> (b & 63)) as u32) << 31);
+                        m &= m.wrapping_sub(1);
+                        i += 1;
+                    }
+                    if i >= cnt {
+                        break;
+                    }
+                }
+            }
+            n += cnt;
+            base += 64;
         }
+        unsafe { ent.set_len(n) };
+        cut!();
     }
+    // final line without a trailing newline: a virtual newline at the end
+    if len > 0 && chunk[len - 1] != b'\n' {
+        unsafe {
+            *qm.get_unchecked_mut(len >> 6) = if len & 63 == 0 { 0 } else { *qm.get_unchecked(len >> 6) };
+        }
+        if len & 63 == 0 {
+            qp[len >> 6] = qtot;
+        }
+        ent.push(E_NL | len as u32);
+        cut!();
+    }
+    let _ = (line_start, skipping);
 }
 
 // ---------------------------------------------------------------- parsing values
@@ -532,27 +702,136 @@ fn digits_in(x: u64, lanes: u64) -> bool {
     (x & hi) == want && (x.wrapping_add(0x0606_0606_0606_0606) & hi) == want
 }
 
+/// Days in month (y, m) for years 1970..2100, same index as MONTH_DAYS.
+static MONTH_LEN: [u8; 130 * 12] = {
+    let mut v = [0u8; 130 * 12];
+    let mut y = 1970u32;
+    while y < 2100 {
+        let mut m = 1u32;
+        while m <= 12 {
+            let d = match m {
+                2 => {
+                    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                        29
+                    } else {
+                        28
+                    }
+                }
+                4 | 6 | 9 | 11 => 30,
+                _ => 31,
+            };
+            v[((y - 1970) * 12 + m - 1) as usize] = d;
+            m += 1;
+        }
+        y += 1;
+    }
+    v
+};
+
+/// Branch-free check and value of `YYYY-MM-DDTHH:MM:SS` in v[0..19] (v.len() >= 20; byte 19
+/// is the caller's). Seconds since the epoch, or None if the shape or a value is bad, or the
+/// year is outside 1970..2100 (the caller then falls back to the general parser).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn ymdhms_fast(v: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    debug_assert!(v.len() >= 20);
+    unsafe {
+        // bytes 4..20: "-MM-DDTHH:MM:SS?"
+        let l = _mm_loadu_si128(v.as_ptr().add(4) as *const __m128i);
+        let tmpl = _mm_setr_epi8(b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, 0);
+        let sep_ok = _mm_movemask_epi8(_mm_cmpeq_epi8(l, tmpl)) as u32;
+        let d = _mm_sub_epi8(l, _mm_set1_epi8(b'0' as i8));
+        let dig_ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(d, _mm_set1_epi8(9)), _mm_set1_epi8(9))) as u32;
+        const SEP: u32 = 1 | 1 << 3 | 1 << 6 | 1 << 9 | 1 << 12;
+        const DIG: u32 = 0b0110_1101_1011_0110; // 1,2,4,5,7,8,10,11,13,14
+        // year: 4 digits at 0..4
+        let yw = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+        let yd = yw.wrapping_sub(0x3030_3030);
+        let y_ok = ((yw & 0xF0F0_F0F0) == 0x3030_3030) & ((yw.wrapping_add(0x0606_0606) & 0xF0F0_F0F0) == 0x3030_3030);
+        let y = (yd & 0xFF) * 1000 + ((yd >> 8) & 0xFF) * 100 + ((yd >> 16) & 0xFF) * 10 + (yd >> 24);
+        // pairs -> [mo, dd, hh, mi, ss] as i16
+        let sh = _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1);
+        let pr = _mm_shuffle_epi8(d, sh);
+        let w = _mm_maddubs_epi16(pr, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
+        // ranges: 1<=mo<=12, 1<=dd<=31, hh<=23, mi<=59, ss<=59
+        let hi = _mm_cmpgt_epi16(w, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0));
+        let lo = _mm_cmpgt_epi16(_mm_setr_epi16(1, 1, 0, 0, 0, 0, 0, 0), w);
+        let bad_rng = _mm_movemask_epi8(_mm_or_si128(hi, lo)) as u32;
+        let hms = _mm_madd_epi16(w, _mm_setr_epi16(0, 0, 3600, 60, 1, 0, 0, 0));
+        let mo = _mm_extract_epi16(w, 0) as u32;
+        let dd = _mm_extract_epi16(w, 1) as u32;
+        let t = _mm_extract_epi32(hms, 1) as i64 + _mm_extract_epi32(hms, 2) as i64;
+        let ok = (sep_ok & SEP) == SEP && (dig_ok & DIG) == DIG && y_ok && bad_rng == 0 && (1970..2100).contains(&y);
+        if !ok {
+            return None;
+        }
+        let idx = ((y - 1970) * 12 + mo - 1) as usize;
+        if dd > *MONTH_LEN.get_unchecked(idx) as u32 {
+            return None;
+        }
+        Some((*MONTH_DAYS.get_unchecked(idx) as i64 + dd as i64 - 1) * 86400 + t)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn ymdhms_fast(v: &[u8]) -> Option<i64> {
+    // portable: the general parser on a copy with a 'Z' zone, limited to the same years
+    let y = v[..4].iter().fold(0u32, |a, &c| a.wrapping_mul(10).wrapping_add(c.wrapping_sub(b'0') as u32));
+    if !(1970..2100).contains(&y) {
+        return None;
+    }
+    let mut t = [0u8; 20];
+    t[..19].copy_from_slice(&v[..19]);
+    t[19] = b'Z';
+    parse_ts(&t).map(|ms| ms / 1000)
+}
+
+/// F1 / F2 / F3 timestamp to epoch ms; None if bad. Same results as parse_ts, with
+/// branch-free fast paths for the three common shapes.
+#[inline(always)]
+fn parse_ts_fast(v: &[u8]) -> Option<i64> {
+    let l = v.len();
+    if l == 20 {
+        if v[19] == b'Z' {
+            if let Some(s) = ymdhms_fast(v) {
+                return Some(s * 1000);
+            }
+        }
+    } else if l == 25 {
+        let o = &v[19..25];
+        let sign = o[0];
+        let (oh1, oh2, om1, om2) = (o[1].wrapping_sub(b'0'), o[2].wrapping_sub(b'0'), o[4].wrapping_sub(b'0'), o[5].wrapping_sub(b'0'));
+        if (sign == b'+' || sign == b'-') && o[3] == b':' && oh1 < 10 && oh2 < 10 && om1 < 10 && om2 < 10 {
+            let oh = oh1 as i64 * 10 + oh2 as i64;
+            let om = om1 as i64 * 10 + om2 as i64;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            if let Some(s) = ymdhms_fast(v) {
+                let off = oh * 3600 + om * 60;
+                return Some(if sign == b'+' { s - off } else { s + off } * 1000);
+            }
+        }
+    } else if l == 13 {
+        let a = ld8(v, 0);
+        let b = ld8(v, 5);
+        if digits_in(a, u64::MAX) && digits_in(b, u64::MAX) {
+            return Some((parse8(a) * 100_000 + parse8(b) % 100_000) as i64);
+        }
+        return None;
+    }
+    parse_ts(v)
+}
+
 /// ingest_ts is always valid F1 (rules.md). Fast path for exactly that shape, with
 /// the full parser as the fallback for anything else, so the result never changes.
 #[inline(always)]
 fn parse_ingest(v: &[u8]) -> i64 {
-    if v.len() == 20 && v[19] == b'Z' && v[10] == b'T' {
-        let a = ld8(v, 0);
-        let b = ld8(v, 8);
-        if digits_in(a, 0x00FF_FF00_FFFF_FFFF) && digits_in(b, 0xFFFF_00FF_FF00_FFFF) {
-            let d = |x: u64, i: u32| ((x >> (8 * i)) as u32 & 0xFF) - 0x30;
-            let y = d(a, 0) * 1000 + d(a, 1) * 100 + d(a, 2) * 10 + d(a, 3);
-            let mo = d(a, 5) * 10 + d(a, 6);
-            let dd = d(b, 0) * 10 + d(b, 1);
-            let h = d(b, 3) * 10 + d(b, 4);
-            let mi = d(b, 6) * 10 + d(b, 7);
-            let (s1, s2) = (v[17].wrapping_sub(b'0') as u32, v[18].wrapping_sub(b'0') as u32);
-            if (1970..2100).contains(&y) && (1..=12).contains(&mo) && dd >= 1 && dd <= dim(y, mo) && h < 24 && mi < 60 && s1 < 6 && s2 < 10
-                && v[4] == b'-' && v[7] == b'-' && v[13] == b':' && v[16] == b':'
-            {
-                let days = MONTH_DAYS[((y - 1970) * 12 + mo - 1) as usize] as i64 + dd as i64 - 1;
-                return (days * 86400 + (h * 3600 + mi * 60 + s1 * 10 + s2) as i64) * 1000;
-            }
+    if v.len() == 20 && v[19] == b'Z' {
+        if let Some(s) = ymdhms_fast(v) {
+            return s * 1000;
         }
     }
     parse_ts(v).unwrap_or(i64::MAX)
@@ -696,19 +975,11 @@ struct Row<'a> {
 /// Dedup record: one per parsed event row.
 #[derive(Clone, Copy)]
 struct D {
-    /// 64-bit fingerprint of the event_id
-    f: u64,
-    /// ingest (25 bits, seconds from window start + 2^24, clamped) << 39
-    /// | (person partition + 1, or 0 if the row is invalid) << 32 | rowid
-    w: u64,
+    eid: u128,
+    ingest: i32, // seconds relative to window start
+    rowid: u32,  // chunk << 20 | row in chunk
+    ppart: u16,  // person partition of the row, or NO_PART if the row is invalid
 }
-#[inline(always)]
-fn dword(ingest: i32, ppart: u16, rowid: u32) -> u64 {
-    let ing = (ingest as i64 + (1 << 24)).clamp(0, (1 << 25) - 1) as u64;
-    let pc = if ppart == NO_PART { 0 } else { ppart as u64 + 1 };
-    (ing << 39) | (pc << 32) | rowid as u64
-}
-const _: () = assert!(NPART < 127);
 const NO_PART: u16 = u16::MAX;
 
 #[derive(Clone, Copy)]
@@ -963,6 +1234,171 @@ impl UserTable {
     }
 }
 
+/// One big lazily-backed anonymous region carved into fixed blocks for the partitioned
+/// event records. Its expected part is populated ahead of time on otherwise idle cores
+/// (while the links are processed), so the parse workers never take a page fault or
+/// wait for the kernel to zero a page; blocks are never freed (the process just exits).
+struct Pool {
+    base: *mut u8,
+    cap: usize,
+    next: std::sync::atomic::AtomicUsize,
+}
+unsafe impl Sync for Pool {}
+unsafe impl Send for Pool {}
+const PBLK: usize = 1 << 16;
+
+impl Pool {
+    fn new(cap: usize) -> Pool {
+        let cap = (cap + (2 << 20)) & !((2 << 20) - 1);
+        #[cfg(target_os = "linux")]
+        let base = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                cap,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "pool mmap");
+            libc::madvise(p, cap, libc::MADV_HUGEPAGE);
+            p as *mut u8
+        };
+        #[cfg(not(target_os = "linux"))]
+        let base = {
+            let v: Vec<u8> = Vec::with_capacity(cap);
+            let mut v = std::mem::ManuallyDrop::new(v);
+            v.as_mut_ptr()
+        };
+        Pool { base, cap, next: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    #[inline]
+    fn take(&self) -> *mut u8 {
+        let o = self.next.fetch_add(PBLK, std::sync::atomic::Ordering::Relaxed);
+        assert!(o + PBLK <= self.cap, "pool exhausted");
+        unsafe { self.base.add(o) }
+    }
+    /// Populate the first `bytes` of the region with `nt` background threads. Contents
+    /// are never written (MADV_POPULATE_WRITE only maps zeroed pages), so this is safe to
+    /// run while workers already fill blocks.
+    fn prefault(&'static self, bytes: usize, nt: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = bytes.min(self.cap);
+            let piece = 32usize << 20;
+            let n = bytes.div_ceil(piece);
+            let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for _ in 0..nt {
+                let next = next.clone();
+                std::thread::spawn(move || loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let a = i * piece;
+                    let l = piece.min(bytes - a);
+                    unsafe {
+                        // MADV_POPULATE_WRITE (Linux 5.14+); older kernels just skip it
+                        libc::madvise(self.base.add(a) as *mut libc::c_void, l, 23);
+                    }
+                });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (bytes, nt);
+    }
+}
+
+/// Append-only record sink backed by pool blocks, with software write-combining: records
+/// gather in a cache-line buffer that lives in L1 and go out as whole 64-byte lines with
+/// non-temporal stores, so a worker writing 128 streams never reads a destination line
+/// in for ownership. T must divide 64 bytes.
+#[repr(C, align(64))]
+struct Sink<T: Copy> {
+    line: [u8; 64],
+    n: usize,
+    cur: *mut T,
+    end: *mut T,
+    blocks: Vec<*mut T>,
+}
+unsafe impl<T: Copy> Send for Sink<T> {}
+unsafe impl<T: Copy> Sync for Sink<T> {}
+
+impl<T: Copy> Sink<T> {
+    const PER_LINE: usize = 64 / std::mem::size_of::<T>();
+    fn new() -> Self {
+        assert!(64 % std::mem::size_of::<T>() == 0 && PBLK % 64 == 0);
+        Sink { line: [0; 64], n: 0, cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
+    }
+    #[inline(always)]
+    fn push(&mut self, pool: &Pool, x: T) {
+        unsafe {
+            (self.line.as_mut_ptr() as *mut T).add(self.n).write(x);
+        }
+        self.n += 1;
+        if self.n == Self::PER_LINE {
+            self.emit(pool);
+        }
+    }
+    #[inline(always)]
+    fn emit(&mut self, pool: &Pool) {
+        if self.cur == self.end {
+            self.refill(pool);
+        }
+        unsafe {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                use std::arch::x86_64::*;
+                let s = self.line.as_ptr() as *const __m256i;
+                let d = self.cur as *mut __m256i;
+                _mm256_stream_si256(d, _mm256_load_si256(s));
+                _mm256_stream_si256(d.add(1), _mm256_load_si256(s.add(1)));
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            std::ptr::copy_nonoverlapping(self.line.as_ptr(), self.cur as *mut u8, 64);
+            self.cur = self.cur.add(Self::PER_LINE);
+        }
+        self.n = 0;
+    }
+    #[inline(never)]
+    fn refill(&mut self, pool: &Pool) {
+        let b = pool.take() as *mut T;
+        self.blocks.push(b);
+        self.cur = b;
+        self.end = unsafe { b.add(PBLK / std::mem::size_of::<T>()) };
+    }
+    /// Write out the partial line (plain stores) and make all stores visible.
+    fn finish(&mut self, pool: &Pool) {
+        if self.n > 0 {
+            if self.cur == self.end {
+                self.refill(pool);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.line.as_ptr() as *const T, self.cur, self.n);
+                self.cur = self.cur.add(self.n);
+            }
+            self.n = 0;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+    }
+    fn slices(&self) -> Vec<&[T]> {
+        debug_assert!(self.n == 0);
+        let per = PBLK / std::mem::size_of::<T>();
+        let n = self.blocks.len();
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let l = if i + 1 == n { unsafe { self.cur.offset_from(b) as usize } } else { per };
+                unsafe { std::slice::from_raw_parts(b as *const T, l) }
+            })
+            .collect()
+    }
+}
+
 const LID_BITS: u32 = 25;
 #[inline(always)]
 fn code(pp: usize, lid: u32) -> u32 {
@@ -1118,6 +1554,15 @@ fn main() {
                 }
             });
         }
+    }
+    // Partitioned event records: 32 + 16 bytes per row. Address space for the worst case
+    // (a row is at least 8 bytes), pages populated in the background for the expected
+    // case (~90 bytes a row) while metadata and links are processed.
+    let ev_bytes_all: usize = ev_maps.iter().map(|m| m.len()).sum();
+    let open_blocks = ncpu.max(1) * 2 * NPART * PBLK;
+    let ev_pool: &'static Pool = Box::leak(Box::new(Pool::new(ev_bytes_all / 8 * 48 + 2 * open_blocks)));
+    if std::env::var("SS_NOPOP").is_err() {
+        ev_pool.prefault(ev_bytes_all / 90 * 48 + open_blocks / 2, 3.min(ncpu.max(1)));
     }
     let prod_map = map_file(&data_dir.join("products.csv"));
     let camp_map = map_file(&data_dir.join("campaigns.csv"));
@@ -1342,8 +1787,9 @@ fn main() {
         rows: &mut Vec<Row<'a>>,
         utab: &UserTable,
         counters: &[std::sync::atomic::AtomicU32],
-        dparts: &mut [Vec<D>],
-        eparts: &mut [Vec<Ev>],
+        pool: &Pool,
+        dparts: &mut [Sink<D>],
+        eparts: &mut [Sink<Ev>],
         nparts: &mut [Vec<(u32, u32, u32)>],
         arena: &mut Vec<u8>,
     ) {
@@ -1352,8 +1798,7 @@ fn main() {
         // pass 1: hash every user and prefetch its slot, so the misses overlap
         for (i, r) in rows.iter().enumerate() {
             if r.kind != K_INVALID {
-                fps[i] = fp(r.ukey);
-                utab.prefetch(fps[i]);
+                fps[i] = fp(r.ukey); // its slot was prefetched when the row was parsed
             }
         }
         for (i, r) in rows.iter().enumerate() {
@@ -1375,22 +1820,27 @@ fn main() {
                 let pp = (cd[i] >> LID_BITS) as usize;
                 let lid = cd[i] & ((1 << LID_BITS) - 1);
                 ppart = pp as u16;
-                eparts[pp].push(Ev { lid, ts: r.ts, pc: (r.price << 8) | r.cat as u32, rowid: r.rowid });
+                eparts[pp].push(pool, Ev { lid, ts: r.ts, pc: (r.price << 8) | r.cat as u32, rowid: r.rowid });
             }
-            let f = fp(r.eid);
-            dparts[((f as u32 as usize) * NPART) >> 32].push(D { f, w: dword(r.ingest, ppart, r.rowid) });
+            dparts[part_of(r.eid)].push(pool, D { eid: r.eid, ingest: r.ingest, rowid: r.rowid, ppart });
         }
         rows.clear();
     }
-    type EvOut = (Vec<Vec<D>>, Vec<Vec<Ev>>, Vec<Vec<(u32, u32, u32)>>, Vec<u8>);
-    let parse_chunk = |ci: usize, c: &&[u8]| -> EvOut {
-            let mut dparts: Vec<Vec<D>> = new_parts(c.len(), 70);
-            let mut eparts: Vec<Vec<Ev>> = new_parts(c.len(), 70);
-            let mut nparts: Vec<Vec<(u32, u32, u32)>> = (0..NPART).map(|_| Vec::new()).collect();
-            let mut arena: Vec<u8> = Vec::new();
+    struct EvW {
+        d: Vec<Sink<D>>,
+        e: Vec<Sink<Ev>>,
+        nparts: Vec<Vec<(u32, u32, u32)>>,
+        arena: Vec<u8>,
+    }
+    let pool: &Pool = ev_pool;
+    let parse_chunk = |ci: usize, c: &[u8], w: &mut EvW| {
+            let EvW { d: dparts, e: eparts, nparts, arena } = w;
+            let mut rows: Vec<Row> = Vec::with_capacity(BLK);
+            let rows = &mut rows;
             let mut li: u32 = 0;
             let base = (ci as u32) << 20;
-            let mut rows: Vec<Row> = Vec::with_capacity(BLK);
+            let cend = c.as_ptr() as usize + c.len();
+            let room = |x: &[u8]| cend - x.as_ptr() as usize;
             for_rows(c, |f: &[&[u8]; 7]| {
                 if f[0].is_empty() {
                     return;
@@ -1410,7 +1860,7 @@ fn main() {
                 let mut cat = 0u8;
                 let mut ukey = 0u128;
                 if !user.is_empty() && !f[5].is_empty() {
-                    if let Some(t) = parse_ts(f[2]) {
+                    if let Some(t) = parse_ts_fast(f[2]) {
                         if t >= ws && t < we && ingest_ms - t <= DAY_MS {
                             kind = match f[4] {
                                 b"view" | b"cart" => K_VALID,
@@ -1426,26 +1876,56 @@ fn main() {
                             };
                             if kind != K_INVALID {
                                 ts = (t - ws) as u32;
-                                ukey = key128(user);
+                                ukey = key128_room(user, room(user));
+                                // start loading the user's slot now: it is needed when this
+                                // block of rows is flushed, up to BLK rows later
+                                utab.prefetch(fp(ukey));
                             }
                         }
                     }
                 }
-                rows.push(Row { ukey, eid: key128(f[0]), user, ingest, ts, price, rowid, cat, kind });
+                rows.push(Row { ukey, eid: key128_room(f[0], room(f[0])), user, ingest, ts, price, rowid, cat, kind });
                 if rows.len() == BLK {
-                    flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts, &mut arena);
+                    flush_rows(rows, utab, counters, pool, dparts, eparts, nparts, arena);
                 }
             });
-            flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts, &mut arena);
+            flush_rows(rows, utab, counters, pool, dparts, eparts, nparts, arena);
             assert!(li < (1 << 20));
             // nothing references this chunk's text any more: drop its page mappings now,
             // in parallel, instead of in the single-threaded teardown at exit
             release(c);
-            (dparts, eparts, nparts, arena)
         };
     // Workers take chunks in file order from a shared counter: together they read the
     // input front to back, right behind the kernel's prefetch, and stay load-balanced.
-    let ev_parsed: Vec<EvOut> = ordered_map(&ev_chunks, ncpu, parse_chunk);
+    // Each keeps its own sinks for the whole phase.
+    let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+    let ev_workers: Vec<EvW> = (0..ncpu.max(1))
+        .into_par_iter()
+        .map(|_| {
+            let mut w = EvW {
+                d: (0..NPART).map(|_| Sink::new()).collect(),
+                e: (0..NPART).map(|_| Sink::new()).collect(),
+                nparts: (0..NPART).map(|_| Vec::new()).collect(),
+                arena: Vec::new(),
+            };
+            loop {
+                let i = next_chunk.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= ev_chunks.len() {
+                    break;
+                }
+                parse_chunk(i, ev_chunks[i], &mut w);
+            }
+            for x in w.d.iter_mut() {
+                x.finish(pool);
+            }
+            for x in w.e.iter_mut() {
+                x.finish(pool);
+            }
+            w
+        })
+        .collect();
+    let dsl: Vec<Vec<&[D]>> = (0..NPART).map(|p| ev_workers.iter().flat_map(|w| w.d[p].slices()).collect()).collect();
+    let esl: Vec<Vec<&[Ev]>> = (0..NPART).map(|p| ev_workers.iter().flat_map(|w| w.e[p].slices()).collect()).collect();
     lap!(format!("events parsed: {} chunks", ev_chunks.len()));
 
     // ---------------- events: dedup on the small records -> per person partition, rows to drop
@@ -1454,39 +1934,38 @@ fn main() {
         .map(|p| {
             // Most event_ids are unique. A two-bit-per-slot filter (seen once / seen
             // twice) finds the rows whose id might repeat; only those are sorted.
-            let n: usize = ev_parsed.iter().map(|c| c.0[p].len()).sum();
+            let n: usize = dsl[p].iter().map(|c| c.len()).sum();
             let bits = (n * 16 + 1024).next_power_of_two();
             let shift = 64 - bits.trailing_zeros();
             let mut seen1 = vec![0u64; bits / 64];
             let mut seen2 = vec![0u64; bits / 64];
-            for c in &ev_parsed {
-                for d in &c.0[p] {
-                    let b = (d.f >> shift) as usize;
+            for c in &dsl[p] {
+                for d in c.iter() {
+                    let b = (mix(d.eid) >> shift) as usize;
                     let (w, m) = (b >> 6, 1u64 << (b & 63));
                     seen2[w] |= seen1[w] & m;
                     seen1[w] |= m;
                 }
             }
             let mut v: Vec<D> = Vec::with_capacity(n / 8 + 16);
-            for c in &ev_parsed {
-                for d in &c.0[p] {
-                    let b = (d.f >> shift) as usize;
+            for c in &dsl[p] {
+                for d in c.iter() {
+                    let b = (mix(d.eid) >> shift) as usize;
                     if seen2[b >> 6] & (1u64 << (b & 63)) != 0 {
                         v.push(*d);
                     }
                 }
             }
-            v.sort_unstable_by_key(|r| (r.f, r.w));
+            v.sort_unstable_by_key(|r| (r.eid, r.ingest));
             let mut out: Vec<Vec<u32>> = (0..NPART).map(|_| Vec::new()).collect();
             let mut i = 0;
             while i < v.len() {
-                let e = v[i].f;
+                let e = v[i].eid;
                 i += 1;
                 // every later copy of this event_id loses to the first (smallest ingest_ts)
-                while i < v.len() && v[i].f == e {
-                    let pc = (v[i].w >> 32) & 0x7F;
-                    if pc != 0 {
-                        out[pc as usize - 1].push(v[i].w as u32);
+                while i < v.len() && v[i].eid == e {
+                    if v[i].ppart != NO_PART {
+                        out[v[i].ppart as usize].push(v[i].rowid);
                     }
                     i += 1;
                 }
@@ -1516,7 +1995,7 @@ fn main() {
                     Some(&c) => c,
                     None => return,
                 };
-                let ts = match parse_ts(f[3]) {
+                let ts = match parse_ts_fast(f[3]) {
                     Some(t) if t >= cws && t < we => t,
                     _ => return,
                 };
@@ -1565,15 +2044,20 @@ fn main() {
             let np = counters[p].load(std::sync::atomic::Ordering::Relaxed) as usize;
             let mut names: Vec<&[u8]> = link_names[p].clone();
             names.resize(np, &[][..]);
-            for c in &ev_parsed {
-                for &(lid, off, len) in &c.2[p] {
-                    names[lid as usize] = &c.3[off as usize..(off + len) as usize];
+            for c in &ev_workers {
+                for &(lid, off, len) in &c.nparts[p] {
+                    names[lid as usize] = &c.arena[off as usize..(off + len) as usize];
                 }
             }
             let mut estart = vec![0u32; np + 1];
             let mut k = 0usize;
-            for c in &ev_parsed {
-                for e in &c.1[p] {
+            for c in &esl[p] {
+                // rowids ascend within a block (one worker fills it in order); start the
+                // pointer at the block's first rowid
+                if nl > 0 && !c.is_empty() {
+                    k = lv.partition_point(|&x| x < c[0].rowid);
+                }
+                for e in c.iter() {
                     if nl > 0 {
                         while lv[k] < e.rowid {
                             k += 1;
@@ -1592,8 +2076,13 @@ fn main() {
             let mut packed: Vec<u64> = vec![0; total];
             let mut pos: Vec<u32> = estart[..np].to_vec();
             let mut k = 0usize;
-            for c in &ev_parsed {
-                for e in &c.1[p] {
+            for c in &esl[p] {
+                // rowids ascend within a block (one worker fills it in order); start the
+                // pointer at the block's first rowid
+                if nl > 0 && !c.is_empty() {
+                    k = lv.partition_point(|&x| x < c[0].rowid);
+                }
+                for e in c.iter() {
                     if nl > 0 {
                         while lv[k] < e.rowid {
                             k += 1;
@@ -1819,7 +2308,9 @@ fn main() {
     lap!("written");
     // Skip freeing the big structures: the process is about to exit.
     std::mem::forget(results);
-    std::mem::forget(ev_parsed);
+    std::mem::forget(dsl);
+    std::mem::forget(esl);
+    std::mem::forget(ev_workers);
     std::mem::forget(losers);
     std::mem::forget(cl_parsed);
     std::process::exit(0);
@@ -1924,4 +2415,80 @@ fn write_campaign_daily(path: &Path, rows: &[(&[u8], &[u8], i32, CAgg)]) {
     col!(rg, Int64Type, &v, None);
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn n(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn ts_fast_matches_reference() {
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let alpha = b"0123456789-+:TZtz .e";
+        let seeds: [&[u8]; 8] = [
+            b"2026-10-03T23:58:10Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2028-02-29T00:00:00+12:00",
+            b"1970-01-01T00:00:00Z",
+            b"2099-12-31T23:59:59-00:00",
+            b"1791071890000",
+            b"2100-01-01T00:00:00Z",
+            b"1969-12-31T23:59:59+00:30",
+        ];
+        let mut n = 0;
+        for _ in 0..3_000_000 {
+            let mut v: Vec<u8> = seeds[(r.n() % 8) as usize].to_vec();
+            let k = r.n() % 4;
+            for _ in 0..k {
+                let i = (r.n() as usize) % v.len();
+                match r.n() % 4 {
+                    0 => v[i] = alpha[(r.n() as usize) % alpha.len()],
+                    1 => v[i] = b'0' + (r.n() % 10) as u8,
+                    2 => v[i] = (r.n() & 0xFF) as u8,
+                    _ => {
+                        if r.n() % 2 == 0 && v.len() > 1 {
+                            v.remove(i);
+                        } else {
+                            v.insert(i, b'0' + (r.n() % 10) as u8);
+                        }
+                    }
+                }
+            }
+            let a = parse_ts(&v);
+            let b = parse_ts_fast(&v);
+            assert_eq!(a, b, "{:?}", String::from_utf8_lossy(&v));
+            if v.len() == 20 && v[19] == b'Z' || v.len() == 20 {
+                assert_eq!(parse_ingest(&v), a.unwrap_or(i64::MAX), "{:?}", String::from_utf8_lossy(&v));
+            }
+            n += a.is_some() as usize;
+            // keys: the one-load form equals the general one
+            let mut buf = v.clone();
+            buf.extend_from_slice(b"0123456789abcdef");
+            assert_eq!(key128_room(&buf[..v.len()], buf.len()), key128(&v));
+        }
+        assert!(n > 100_000);
+        // every day of every month, both zones
+        for y in 1969..2101 {
+            for m in 0..14 {
+                for d in 0..33 {
+                    for &(h, mi, s) in &[(0, 0, 0), (23, 59, 59), (24, 0, 0), (12, 60, 0), (12, 0, 60)] {
+                        let f1 = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, h, mi, s);
+                        assert_eq!(parse_ts(f1.as_bytes()), parse_ts_fast(f1.as_bytes()), "{}", f1);
+                        let f2 = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+05:30", y, m, d, h, mi, s);
+                        assert_eq!(parse_ts(f2.as_bytes()), parse_ts_fast(f2.as_bytes()), "{}", f2);
+                    }
+                }
+            }
+        }
+    }
 }
