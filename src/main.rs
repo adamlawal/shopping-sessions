@@ -696,11 +696,19 @@ struct Row<'a> {
 /// Dedup record: one per parsed event row.
 #[derive(Clone, Copy)]
 struct D {
-    eid: u128,
-    ingest: i32, // seconds relative to window start
-    rowid: u32,  // chunk << 20 | row in chunk
-    ppart: u16,  // person partition of the row, or NO_PART if the row is invalid
+    /// 64-bit fingerprint of the event_id
+    f: u64,
+    /// ingest (25 bits, seconds from window start + 2^24, clamped) << 39
+    /// | (person partition + 1, or 0 if the row is invalid) << 32 | rowid
+    w: u64,
 }
+#[inline(always)]
+fn dword(ingest: i32, ppart: u16, rowid: u32) -> u64 {
+    let ing = (ingest as i64 + (1 << 24)).clamp(0, (1 << 25) - 1) as u64;
+    let pc = if ppart == NO_PART { 0 } else { ppart as u64 + 1 };
+    (ing << 39) | (pc << 32) | rowid as u64
+}
+const _: () = assert!(NPART < 127);
 const NO_PART: u16 = u16::MAX;
 
 #[derive(Clone, Copy)]
@@ -1369,7 +1377,8 @@ fn main() {
                 ppart = pp as u16;
                 eparts[pp].push(Ev { lid, ts: r.ts, pc: (r.price << 8) | r.cat as u32, rowid: r.rowid });
             }
-            dparts[part_of(r.eid)].push(D { eid: r.eid, ingest: r.ingest, rowid: r.rowid, ppart });
+            let f = fp(r.eid);
+            dparts[((f as u32 as usize) * NPART) >> 32].push(D { f, w: dword(r.ingest, ppart, r.rowid) });
         }
         rows.clear();
     }
@@ -1452,7 +1461,7 @@ fn main() {
             let mut seen2 = vec![0u64; bits / 64];
             for c in &ev_parsed {
                 for d in &c.0[p] {
-                    let b = (mix(d.eid) >> shift) as usize;
+                    let b = (d.f >> shift) as usize;
                     let (w, m) = (b >> 6, 1u64 << (b & 63));
                     seen2[w] |= seen1[w] & m;
                     seen1[w] |= m;
@@ -1461,22 +1470,23 @@ fn main() {
             let mut v: Vec<D> = Vec::with_capacity(n / 8 + 16);
             for c in &ev_parsed {
                 for d in &c.0[p] {
-                    let b = (mix(d.eid) >> shift) as usize;
+                    let b = (d.f >> shift) as usize;
                     if seen2[b >> 6] & (1u64 << (b & 63)) != 0 {
                         v.push(*d);
                     }
                 }
             }
-            v.sort_unstable_by_key(|r| (r.eid, r.ingest));
+            v.sort_unstable_by_key(|r| (r.f, r.w));
             let mut out: Vec<Vec<u32>> = (0..NPART).map(|_| Vec::new()).collect();
             let mut i = 0;
             while i < v.len() {
-                let e = v[i].eid;
+                let e = v[i].f;
                 i += 1;
                 // every later copy of this event_id loses to the first (smallest ingest_ts)
-                while i < v.len() && v[i].eid == e {
-                    if v[i].ppart != NO_PART {
-                        out[v[i].ppart as usize].push(v[i].rowid);
+                while i < v.len() && v[i].f == e {
+                    let pc = (v[i].w >> 32) & 0x7F;
+                    if pc != 0 {
+                        out[pc as usize - 1].push(v[i].w as u32);
                     }
                     i += 1;
                 }
