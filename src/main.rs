@@ -31,7 +31,7 @@ const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const CHUNK: usize = 4 << 20;
-const NPART: usize = 128;
+const NPART: usize = 64;
 const BLK: usize = 128;
 
 const K_INVALID: u8 = 0;
@@ -1187,8 +1187,12 @@ fn main() {
     }
     let ln_bytes: usize = ln_maps.iter().map(|m| m.len()).sum();
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
-    // every link line holds two IDs and is at least ~10 bytes long in practice
-    let utab = UserTable::new(ln_bytes / 5 + ev_bytes / 1200 + 1024);
+    // Size: link lines (counted exactly) + a generous estimate of users seen only in
+    // events (bytes/1200 is ~6x the real count). Even if every line brought two new
+    // IDs, the table would stay under its 90% probe limit.
+    let _ = ln_bytes;
+    let ln_lines: usize = ln_maps.par_iter().map(|m| memchr::memchr_iter(b'\n', m).count()).sum();
+    let utab = UserTable::new(ln_lines + ln_lines / 4 + ev_bytes / 1200 + 1024);
     let next_gid = std::sync::atomic::AtomicU32::new(0);
     const GBLK: u32 = 1024;
     type LinkOut<'a> = (Vec<(u32, u32)>, Vec<(u32, u128, &'a [u8])>);
