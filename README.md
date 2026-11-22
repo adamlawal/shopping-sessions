@@ -1,4 +1,4 @@
-# Shopping Sessions (Builders Buildathon, Databricks track)
+# Shopping Sessions
 
 A native Rust pipeline that turns the click-stream CSVs in `/data` into the
 `user_daily` and `campaign_daily` Parquet tables defined in `rules.md`.
