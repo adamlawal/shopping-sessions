@@ -148,6 +148,22 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Drop the page mappings of the whole pages inside `c` (file-backed, read-only: the
+/// data stays in the page cache, and any later access would simply fault it back in).
+fn release(c: &[u8]) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let pg = 4096usize;
+        let a = (c.as_ptr() as usize + pg - 1) & !(pg - 1);
+        let b = (c.as_ptr() as usize + c.len()) & !(pg - 1);
+        if b > a {
+            libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = c;
+}
+
 fn map_file(p: &Path) -> Option<Mmap> {
     let f = File::open(p).ok()?;
     let len = f.metadata().ok()?.len();
@@ -823,27 +839,33 @@ fn fp(k: u128) -> u64 {
 /// Lock-free table: user-ID fingerprint -> person code (partition << 25 | local id).
 /// Filled with every linked ID before the events are read; unlinked users are
 /// added the first time a valid event names them.
+#[repr(C)]
+struct Slot {
+    key: std::sync::atomic::AtomicU64,
+    val: std::sync::atomic::AtomicU32,
+    _pad: u32,
+}
+
+/// Lock-free table: user-ID fingerprint -> person code (partition << 25 | local id).
+/// Key and value share one 16-byte slot, so a lookup touches one cache line.
 struct UserTable {
-    keys: Vec<std::sync::atomic::AtomicU64>,
-    vals: Vec<std::sync::atomic::AtomicU32>,
+    slots: Vec<Slot>,
     shift: u32,
     mask: usize,
-    used: std::sync::atomic::AtomicUsize,
 }
 
 impl UserTable {
     fn new(n: usize) -> Self {
         let cap = (n + 1024).next_power_of_two();
-        // AtomicU64/U32 have the layout of u64/u32: allocate zeroed memory directly
-        let keys: Vec<std::sync::atomic::AtomicU64> = unsafe { std::mem::transmute(vec![0u64; cap]) };
-        let vals: Vec<std::sync::atomic::AtomicU32> = unsafe { std::mem::transmute(vec![0u32; cap]) };
-        UserTable { keys, vals, shift: 64 - cap.trailing_zeros(), mask: cap - 1, used: std::sync::atomic::AtomicUsize::new(0) }
+        // Slot is two zeroed words with the layout of [u64; 2]: allocate zeroed memory directly
+        let slots: Vec<Slot> = unsafe { std::mem::transmute(vec![[0u64; 2]; cap]) };
+        UserTable { slots, shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
     }
     #[inline(always)]
     fn val(&self, h: usize) -> u32 {
         use std::sync::atomic::Ordering::Acquire;
         loop {
-            let v = self.vals[h].load(Acquire);
+            let v = self.slots[h].val.load(Acquire);
             if v != 0 {
                 return v - 1;
             }
@@ -855,7 +877,7 @@ impl UserTable {
         use std::sync::atomic::Ordering::Acquire;
         let mut h = (f >> self.shift) as usize;
         loop {
-            let k = self.keys[h].load(Acquire);
+            let k = self.slots[h].key.load(Acquire);
             if k == f {
                 return self.val(h);
             }
@@ -873,15 +895,15 @@ impl UserTable {
         loop {
             probes += 1;
             assert!(probes <= self.mask, "user table full");
-            let k = self.keys[h].load(Acquire);
+            let k = self.slots[h].key.load(Acquire);
             if k == f {
                 return self.val(h);
             }
             if k == 0 {
-                match self.keys[h].compare_exchange(0, f, AcqRel, Acquire) {
+                match self.slots[h].key.compare_exchange(0, f, AcqRel, Acquire) {
                     Ok(_) => {
                         let v = make();
-                        self.vals[h].store(v + 1, Release);
+                        self.slots[h].val.store(v + 1, Release);
                         return v;
                     }
                     Err(cur) => {
@@ -1212,7 +1234,8 @@ fn main() {
         counters: &[std::sync::atomic::AtomicU32],
         dparts: &mut [Vec<D>],
         eparts: &mut [Vec<Ev>],
-        nparts: &mut [Vec<(u32, &'a [u8])>],
+        nparts: &mut [Vec<(u32, u32, u32)>],
+        arena: &mut Vec<u8>,
     ) {
         let mut cd = [u32::MAX; BLK];
         for (i, r) in rows.iter().enumerate() {
@@ -1221,7 +1244,9 @@ fn main() {
                     // a user seen for the first time and not linked: a person of their own
                     let pp = part_of(r.ukey);
                     let lid = counters[pp].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    nparts[pp].push((lid, r.user));
+                    // copy the name: the event text is released right after this chunk
+                    nparts[pp].push((lid, arena.len() as u32, r.user.len() as u32));
+                    arena.extend_from_slice(r.user);
                     code(pp, lid)
                 });
             }
@@ -1238,14 +1263,15 @@ fn main() {
         }
         rows.clear();
     }
-    type EvOut<'a> = (Vec<Vec<D>>, Vec<Vec<Ev>>, Vec<Vec<(u32, &'a [u8])>>);
+    type EvOut = (Vec<Vec<D>>, Vec<Vec<Ev>>, Vec<Vec<(u32, u32, u32)>>, Vec<u8>);
     let ev_parsed: Vec<EvOut> = ev_chunks
         .par_iter()
         .enumerate()
         .map(|(ci, c)| {
             let mut dparts: Vec<Vec<D>> = new_parts(c.len(), 70);
             let mut eparts: Vec<Vec<Ev>> = new_parts(c.len(), 70);
-            let mut nparts: Vec<Vec<(u32, &[u8])>> = (0..NPART).map(|_| Vec::new()).collect();
+            let mut nparts: Vec<Vec<(u32, u32, u32)>> = (0..NPART).map(|_| Vec::new()).collect();
+            let mut arena: Vec<u8> = Vec::new();
             let mut li: u32 = 0;
             let base = (ci as u32) << 20;
             let mut rows: Vec<Row> = Vec::with_capacity(BLK);
@@ -1291,12 +1317,15 @@ fn main() {
                 }
                 rows.push(Row { ukey, eid: key128(f[0]), user, ingest, ts, price, rowid, cat, kind });
                 if rows.len() == BLK {
-                    flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts);
+                    flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts, &mut arena);
                 }
             });
-            flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts);
+            flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts, &mut arena);
             assert!(li < (1 << 20));
-            (dparts, eparts, nparts)
+            // nothing references this chunk's text any more: drop its page mappings now,
+            // in parallel, instead of in the single-threaded teardown at exit
+            release(c);
+            (dparts, eparts, nparts, arena)
         })
         .collect();
     lap!(format!("events parsed: {} chunks", ev_chunks.len()));
@@ -1432,8 +1461,8 @@ fn main() {
             let mut names: Vec<&[u8]> = link_names[p].clone();
             names.resize(np, &[][..]);
             for c in &ev_parsed {
-                for &(lid, nm) in &c.2[p] {
-                    names[lid as usize] = nm;
+                for &(lid, off, len) in &c.2[p] {
+                    names[lid as usize] = &c.3[off as usize..(off + len) as usize];
                 }
             }
             let mut estart = vec![0u32; np + 1];
