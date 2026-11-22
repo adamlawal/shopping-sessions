@@ -167,28 +167,6 @@ fn release(c: &[u8]) {
     let _ = c;
 }
 
-/// Map items to results in parallel; workers claim items in index order from a counter.
-fn ordered_map<T: Sync, R: Send>(items: &[T], nthreads: usize, f: impl Fn(usize, &T) -> R + Sync) -> Vec<R> {
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut parts: Vec<Vec<(usize, R)>> = (0..nthreads.max(1))
-        .into_par_iter()
-        .map(|_| {
-            let mut out = Vec::new();
-            loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= items.len() {
-                    break;
-                }
-                out.push((i, f(i, &items[i])));
-            }
-            out
-        })
-        .collect();
-    let mut all: Vec<(usize, R)> = parts.drain(..).flatten().collect();
-    all.sort_unstable_by_key(|x| x.0);
-    all.into_iter().map(|x| x.1).collect()
-}
-
 fn map_file(p: &Path) -> Option<Mmap> {
     let f = File::open(p).ok()?;
     let len = f.metadata().ok()?.len();
@@ -371,81 +349,238 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (c, n, q)
 }
 
-/// Tokenize a whole chunk in one pass: for every well-formed line with exactly N
-/// fields, call f with the unquoted fields. Malformed and empty lines are skipped.
-/// A line's quotes are valid exactly when every quote is part of a field wrapped
-/// in quotes, i.e. when the line's quote count is twice the number of wrapped fields.
+/// Low `n` bits of x (all of x when n >= 64): BMI2 bzhi on x86.
 #[inline(always)]
-fn for_rows<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
-    let len = chunk.len();
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut n = 0usize;
-    let mut field_start = 0usize;
-    let mut q_total = 0u32; // quotes before the current block
-    let mut q_line = 0u32; // running quote count at line start
+fn low_bits(x: u64, n: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_bzhi_u64(x, n)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        if n >= 64 { x } else { x & ((1u64 << n) - 1) }
+    }
+}
 
-    #[inline(always)]
-    fn finish<'a, const N: usize>(fields: &mut [&'a [u8]; N], nq: u32) -> bool {
-        if nq == 0 {
-            return true;
+/// Separator entry: bit 31 = newline, bits 0..31 = its position in the chunk.
+const E_NL: u32 = 1 << 31;
+const WIN_BLOCKS: usize = 64;
+/// Software prefetch distance for the input scan, in bytes.
+const PF_DIST: usize = 8192;
+
+/// Reused per-thread scratch for for_rows: separator entries of the current window, and
+/// per 64-byte block of the chunk its quote mask and the quotes before it.
+#[derive(Default)]
+struct Scratch {
+    ent: Vec<u32>,
+    qm: Vec<u64>,
+    qp: Vec<u32>,
+}
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// Newline flags (bit 31) of 8 consecutive entries at e, as 8 bits. The entry buffer
+/// always has slack capacity after its last entry, so reading 8 is in bounds.
+#[inline(always)]
+unsafe fn nl_flags8(e: *const u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_loadu_si256(e as *const __m256i))) as u32
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    unsafe {
+        let mut m = 0u32;
+        for j in 0..8 {
+            m |= (*e.add(j) >> 31) << j;
         }
-        let mut wrapped = 0u32;
-        for v in fields.iter_mut() {
-            let raw = *v;
-            let l = raw.len();
-            if l >= 2 && raw[0] == b'"' && raw[l - 1] == b'"' {
-                wrapped += 2;
-                *v = &raw[1..l - 1];
-            }
-        }
-        wrapped == nq
+        m
+    }
+}
+
+/// Tokenize a whole chunk in one pass over its bytes: for every well-formed line with
+/// exactly N fields, call f with the unquoted fields. Malformed and empty lines are skipped.
+///
+/// Each 64-byte block gives bit masks of commas, newlines and quotes. The set separator
+/// bits are written out without branches (position + newline flag) into a small buffer
+/// that stays in L1, and rows are then cut from it N separators at a time: a row is
+/// well-shaped when exactly its N-th separator is a newline. A line's quotes are valid
+/// exactly when every quote is part of a field wrapped in quotes, i.e. when the line's
+/// quote count (from the per-block quote masks) is twice the number of wrapped fields.
+#[inline(always)]
+fn for_rows<'a, const N: usize>(chunk: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        for_rows_in(chunk, &mut s, f)
+    })
+}
+
+#[inline(always)]
+fn for_rows_in<'a, const N: usize>(chunk: &'a [u8], sc: &mut Scratch, mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = chunk.len();
+    assert!(len < (1usize << 31) - 64);
+    let nblk = len / 64 + 2;
+    let Scratch { ent, qm, qp } = sc;
+    const ECAP: usize = WIN_BLOCKS * 64 + 256;
+    if ent.capacity() < ECAP {
+        // zero-filled once, so the 8-wide flag reads past the last entry see initialized memory
+        *ent = vec![0u32; ECAP];
+    }
+    ent.clear();
+    if qm.len() < nblk {
+        qm.resize(nblk, 0);
+        qp.resize(nblk, 0);
+    }
+    let qm = &mut qm[..];
+    let qp = &mut qp[..];
+    let mut line_start = 0usize; // first byte of the current line
+    let mut skipping = false; // inside a line with more than N fields: drop until its newline
+    let mut qtot = 0u32;
+    let mut tail = [0u8; 64];
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+
+    // quotes in the chunk before position p (p's block is already scanned)
+    macro_rules! qat {
+        ($p:expr) => {{
+            let p = $p;
+            unsafe { *qp.get_unchecked(p >> 6) + low_bits(*qm.get_unchecked(p >> 6), (p & 63) as u32).count_ones() }
+        }};
     }
 
-    let mut tail = [0u8; 64];
-    let mut base = 0usize;
-    while base < len {
-        let (cm, nl, qt) = if base + 64 <= len {
-            unsafe { masks64(chunk.as_ptr().add(base)) }
-        } else {
-            let r = len - base;
-            tail[..r].copy_from_slice(&chunk[base..]);
-            tail[r..].fill(0);
-            unsafe { masks64(tail.as_ptr()) }
-        };
-        let mut m = cm | nl;
-        while m != 0 {
-            let bit = m.trailing_zeros();
-            let pos = base + bit as usize;
-            if (nl >> bit) & 1 == 0 {
-                if n < N {
-                    fields[n] = unsafe { chunk.get_unchecked(field_start..pos) };
+    // Cut rows from ent; leftover separators of an unfinished line stay at the front.
+    macro_rules! cut {
+        () => {{
+            let n = ent.len();
+            let e = ent.as_ptr();
+            let mut k = 0usize;
+            if skipping {
+                while k < n && unsafe { *e.add(k) } & E_NL == 0 {
+                    k += 1;
                 }
-                n += 1;
-                field_start = pos + 1;
-            } else {
-                let q_here = q_total + (qt & ((1u64 << bit) - 1)).count_ones();
-                if n + 1 == N {
-                    fields[n] = unsafe { chunk.get_unchecked(field_start..pos) };
-                    if finish(&mut fields, q_here - q_line) {
+                if k < n {
+                    line_start = (unsafe { *e.add(k) } & !E_NL) as usize + 1;
+                    skipping = false;
+                    k += 1;
+                }
+            }
+            while !skipping && k + N <= n {
+                let nlb = unsafe { nl_flags8(e.add(k)) } & ((1u32 << N) - 1);
+                if nlb == 1 << (N - 1) {
+                    let mut s = line_start;
+                    let mut wrapped = 0u32;
+                    let mut p = 0usize;
+                    for j in 0..N {
+                        p = (unsafe { *e.add(k + j) } & !E_NL) as usize;
+                        let l = p - s;
+                        // branch-free: both end bytes are read even for short fields
+                        let c0 = unsafe { *chunk.get_unchecked(s.min(len - 1)) };
+                        let c1 = unsafe { *chunk.get_unchecked(p.max(1) - 1) };
+                        let w = ((l >= 2) & (c0 == b'"') & (c1 == b'"')) as usize;
+                        fields[j] = unsafe { chunk.get_unchecked(s + w..p - w) };
+                        wrapped += w as u32;
+                        s = p + 1;
+                    }
+                    let q = qat!(p) - qat!(line_start);
+                    if 2 * wrapped == q {
                         f(&fields);
                     }
+                    line_start = s;
+                    k += N;
+                } else if nlb != 0 {
+                    // a line with fewer than N fields (or empty): malformed
+                    let t = nlb.trailing_zeros() as usize;
+                    line_start = (unsafe { *e.add(k + t) } & !E_NL) as usize + 1;
+                    k += t + 1;
+                } else {
+                    // more than N fields
+                    k += N;
+                    while k < n && unsafe { *e.add(k) } & E_NL == 0 {
+                        k += 1;
+                    }
+                    if k < n {
+                        line_start = (unsafe { *e.add(k) } & !E_NL) as usize + 1;
+                        k += 1;
+                    } else {
+                        skipping = true;
+                    }
                 }
-                n = 0;
-                field_start = pos + 1;
-                q_line = q_here;
             }
-            m &= m - 1;
-        }
-        q_total += qt.count_ones();
-        base += 64;
+            if skipping {
+                ent.clear();
+            } else {
+                let rest = n - k;
+                unsafe { std::ptr::copy(e.add(k), ent.as_mut_ptr(), rest) };
+                unsafe { ent.set_len(rest) };
+            }
+        }};
     }
-    // final line without a trailing newline
-    if field_start < len && n + 1 == N {
-        fields[n] = &chunk[field_start..len];
-        if finish(&mut fields, q_total - q_line) {
-            f(&fields);
+
+    let mut base = 0usize;
+    while base < len {
+        let wend = (base + WIN_BLOCKS * 64).min(len);
+        // leftover < N entries + a window of at most 64 per block + 8 entries of slack
+        assert!(ent.len() + WIN_BLOCKS * 64 + 72 <= ent.capacity());
+        let mut n = ent.len();
+        let dst = ent.as_mut_ptr();
+        while base < wend {
+            let (cm, nl, qt) = if base + 64 <= len {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    // the hardware streamer stops at 4 KB pages: run ahead across them
+                    let pd = PF_DIST;
+                    if base + pd < len {
+                        std::arch::x86_64::_mm_prefetch(chunk.as_ptr().add(base + pd) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    }
+                }
+                unsafe { masks64(chunk.as_ptr().add(base)) }
+            } else {
+                let r = len - base;
+                tail[..r].copy_from_slice(&chunk[base..]);
+                tail[r..].fill(0);
+                unsafe { masks64(tail.as_ptr()) }
+            };
+            unsafe {
+                *qm.get_unchecked_mut(base >> 6) = qt;
+                *qp.get_unchecked_mut(base >> 6) = qtot;
+            }
+            qtot += qt.count_ones();
+            let mut m = cm | nl;
+            let cnt = m.count_ones() as usize;
+            let b32 = base as u32;
+            unsafe {
+                let d = dst.add(n);
+                let mut i = 0usize;
+                loop {
+                    for _ in 0..8 {
+                        let b = m.trailing_zeros();
+                        *d.add(i) = (b32 + b) | (((nl >> (b & 63)) as u32) << 31);
+                        m &= m.wrapping_sub(1);
+                        i += 1;
+                    }
+                    if i >= cnt {
+                        break;
+                    }
+                }
+            }
+            n += cnt;
+            base += 64;
         }
+        unsafe { ent.set_len(n) };
+        cut!();
     }
+    // final line without a trailing newline: a virtual newline at the end
+    if len > 0 && chunk[len - 1] != b'\n' {
+        unsafe {
+            *qm.get_unchecked_mut(len >> 6) = if len & 63 == 0 { 0 } else { *qm.get_unchecked(len >> 6) };
+        }
+        if len & 63 == 0 {
+            qp[len >> 6] = qtot;
+        }
+        ent.push(E_NL | len as u32);
+        cut!();
+    }
+    let _ = (line_start, skipping);
 }
 
 // ---------------------------------------------------------------- parsing values
@@ -955,6 +1090,125 @@ impl UserTable {
     }
 }
 
+/// One big lazily-backed anonymous region carved into fixed blocks for the partitioned
+/// event records. Its expected part is populated ahead of time on otherwise idle cores
+/// (while the links are processed), so the parse workers never take a page fault or
+/// wait for the kernel to zero a page; blocks are never freed (the process just exits).
+struct Pool {
+    base: *mut u8,
+    cap: usize,
+    next: std::sync::atomic::AtomicUsize,
+}
+unsafe impl Sync for Pool {}
+unsafe impl Send for Pool {}
+const PBLK: usize = 1 << 16;
+
+impl Pool {
+    fn new(cap: usize) -> Pool {
+        let cap = (cap + (2 << 20)) & !((2 << 20) - 1);
+        #[cfg(target_os = "linux")]
+        let base = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                cap,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "pool mmap");
+            libc::madvise(p, cap, libc::MADV_HUGEPAGE);
+            p as *mut u8
+        };
+        #[cfg(not(target_os = "linux"))]
+        let base = {
+            let v: Vec<u8> = Vec::with_capacity(cap);
+            let mut v = std::mem::ManuallyDrop::new(v);
+            v.as_mut_ptr()
+        };
+        Pool { base, cap, next: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    #[inline]
+    fn take(&self) -> *mut u8 {
+        let o = self.next.fetch_add(PBLK, std::sync::atomic::Ordering::Relaxed);
+        assert!(o + PBLK <= self.cap, "pool exhausted");
+        unsafe { self.base.add(o) }
+    }
+    /// Populate the first `bytes` of the region with `nt` background threads. Contents
+    /// are never written (MADV_POPULATE_WRITE only maps zeroed pages), so this is safe to
+    /// run while workers already fill blocks.
+    fn prefault(&'static self, bytes: usize, nt: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = bytes.min(self.cap);
+            let piece = 32usize << 20;
+            let n = bytes.div_ceil(piece);
+            let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for _ in 0..nt {
+                let next = next.clone();
+                std::thread::spawn(move || loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let a = i * piece;
+                    let l = piece.min(bytes - a);
+                    unsafe {
+                        // MADV_POPULATE_WRITE (Linux 5.14+); older kernels just skip it
+                        libc::madvise(self.base.add(a) as *mut libc::c_void, l, 23);
+                    }
+                });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (bytes, nt);
+    }
+}
+
+/// Append-only record sink backed by pool blocks.
+struct Sink<T: Copy> {
+    cur: *mut T,
+    end: *mut T,
+    blocks: Vec<*mut T>,
+}
+unsafe impl<T: Copy> Send for Sink<T> {}
+unsafe impl<T: Copy> Sync for Sink<T> {}
+
+impl<T: Copy> Sink<T> {
+    fn new() -> Self {
+        Sink { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
+    }
+    #[inline(always)]
+    fn push(&mut self, pool: &Pool, x: T) {
+        if self.cur == self.end {
+            self.refill(pool);
+        }
+        unsafe {
+            self.cur.write(x);
+            self.cur = self.cur.add(1);
+        }
+    }
+    #[inline(never)]
+    fn refill(&mut self, pool: &Pool) {
+        let b = pool.take() as *mut T;
+        self.blocks.push(b);
+        self.cur = b;
+        self.end = unsafe { b.add(PBLK / std::mem::size_of::<T>()) };
+    }
+    fn slices(&self) -> Vec<&[T]> {
+        let per = PBLK / std::mem::size_of::<T>();
+        let n = self.blocks.len();
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let l = if i + 1 == n { unsafe { self.cur.offset_from(b) as usize } } else { per };
+                unsafe { std::slice::from_raw_parts(b as *const T, l) }
+            })
+            .collect()
+    }
+}
+
 const LID_BITS: u32 = 25;
 #[inline(always)]
 fn code(pp: usize, lid: u32) -> u32 {
@@ -1110,6 +1364,15 @@ fn main() {
                 }
             });
         }
+    }
+    // Partitioned event records: 32 + 16 bytes per row. Address space for the worst case
+    // (a row is at least 8 bytes), pages populated in the background for the expected
+    // case (~90 bytes a row) while metadata and links are processed.
+    let ev_bytes_all: usize = ev_maps.iter().map(|m| m.len()).sum();
+    let open_blocks = ncpu.max(1) * 2 * NPART * PBLK;
+    let ev_pool: &'static Pool = Box::leak(Box::new(Pool::new(ev_bytes_all / 8 * 48 + 2 * open_blocks)));
+    if std::env::var("SS_NOPOP").is_err() {
+        ev_pool.prefault(ev_bytes_all / 90 * 48 + open_blocks / 2, 3.min(ncpu.max(1)));
     }
     let prod_map = map_file(&data_dir.join("products.csv"));
     let camp_map = map_file(&data_dir.join("campaigns.csv"));
@@ -1334,8 +1597,9 @@ fn main() {
         rows: &mut Vec<Row<'a>>,
         utab: &UserTable,
         counters: &[std::sync::atomic::AtomicU32],
-        dparts: &mut [Vec<D>],
-        eparts: &mut [Vec<Ev>],
+        pool: &Pool,
+        dparts: &mut [Sink<D>],
+        eparts: &mut [Sink<Ev>],
         nparts: &mut [Vec<(u32, u32, u32)>],
         arena: &mut Vec<u8>,
     ) {
@@ -1367,21 +1631,25 @@ fn main() {
                 let pp = (cd[i] >> LID_BITS) as usize;
                 let lid = cd[i] & ((1 << LID_BITS) - 1);
                 ppart = pp as u16;
-                eparts[pp].push(Ev { lid, ts: r.ts, pc: (r.price << 8) | r.cat as u32, rowid: r.rowid });
+                eparts[pp].push(pool, Ev { lid, ts: r.ts, pc: (r.price << 8) | r.cat as u32, rowid: r.rowid });
             }
-            dparts[part_of(r.eid)].push(D { eid: r.eid, ingest: r.ingest, rowid: r.rowid, ppart });
+            dparts[part_of(r.eid)].push(pool, D { eid: r.eid, ingest: r.ingest, rowid: r.rowid, ppart });
         }
         rows.clear();
     }
-    type EvOut = (Vec<Vec<D>>, Vec<Vec<Ev>>, Vec<Vec<(u32, u32, u32)>>, Vec<u8>);
-    let parse_chunk = |ci: usize, c: &&[u8]| -> EvOut {
-            let mut dparts: Vec<Vec<D>> = new_parts(c.len(), 70);
-            let mut eparts: Vec<Vec<Ev>> = new_parts(c.len(), 70);
-            let mut nparts: Vec<Vec<(u32, u32, u32)>> = (0..NPART).map(|_| Vec::new()).collect();
-            let mut arena: Vec<u8> = Vec::new();
+    struct EvW {
+        d: Vec<Sink<D>>,
+        e: Vec<Sink<Ev>>,
+        nparts: Vec<Vec<(u32, u32, u32)>>,
+        arena: Vec<u8>,
+    }
+    let pool: &Pool = ev_pool;
+    let parse_chunk = |ci: usize, c: &[u8], w: &mut EvW| {
+            let EvW { d: dparts, e: eparts, nparts, arena } = w;
+            let mut rows: Vec<Row> = Vec::with_capacity(BLK);
+            let rows = &mut rows;
             let mut li: u32 = 0;
             let base = (ci as u32) << 20;
-            let mut rows: Vec<Row> = Vec::with_capacity(BLK);
             for_rows(c, |f: &[&[u8]; 7]| {
                 if f[0].is_empty() {
                     return;
@@ -1424,19 +1692,40 @@ fn main() {
                 }
                 rows.push(Row { ukey, eid: key128(f[0]), user, ingest, ts, price, rowid, cat, kind });
                 if rows.len() == BLK {
-                    flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts, &mut arena);
+                    flush_rows(rows, utab, counters, pool, dparts, eparts, nparts, arena);
                 }
             });
-            flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts, &mut arena);
+            flush_rows(rows, utab, counters, pool, dparts, eparts, nparts, arena);
             assert!(li < (1 << 20));
             // nothing references this chunk's text any more: drop its page mappings now,
             // in parallel, instead of in the single-threaded teardown at exit
             release(c);
-            (dparts, eparts, nparts, arena)
         };
     // Workers take chunks in file order from a shared counter: together they read the
     // input front to back, right behind the kernel's prefetch, and stay load-balanced.
-    let ev_parsed: Vec<EvOut> = ordered_map(&ev_chunks, ncpu, parse_chunk);
+    // Each keeps its own sinks for the whole phase.
+    let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+    let ev_workers: Vec<EvW> = (0..ncpu.max(1))
+        .into_par_iter()
+        .map(|_| {
+            let mut w = EvW {
+                d: (0..NPART).map(|_| Sink::new()).collect(),
+                e: (0..NPART).map(|_| Sink::new()).collect(),
+                nparts: (0..NPART).map(|_| Vec::new()).collect(),
+                arena: Vec::new(),
+            };
+            loop {
+                let i = next_chunk.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= ev_chunks.len() {
+                    break;
+                }
+                parse_chunk(i, ev_chunks[i], &mut w);
+            }
+            w
+        })
+        .collect();
+    let dsl: Vec<Vec<&[D]>> = (0..NPART).map(|p| ev_workers.iter().flat_map(|w| w.d[p].slices()).collect()).collect();
+    let esl: Vec<Vec<&[Ev]>> = (0..NPART).map(|p| ev_workers.iter().flat_map(|w| w.e[p].slices()).collect()).collect();
     lap!(format!("events parsed: {} chunks", ev_chunks.len()));
 
     // ---------------- events: dedup on the small records -> per person partition, rows to drop
@@ -1445,13 +1734,13 @@ fn main() {
         .map(|p| {
             // Most event_ids are unique. A two-bit-per-slot filter (seen once / seen
             // twice) finds the rows whose id might repeat; only those are sorted.
-            let n: usize = ev_parsed.iter().map(|c| c.0[p].len()).sum();
+            let n: usize = dsl[p].iter().map(|c| c.len()).sum();
             let bits = (n * 16 + 1024).next_power_of_two();
             let shift = 64 - bits.trailing_zeros();
             let mut seen1 = vec![0u64; bits / 64];
             let mut seen2 = vec![0u64; bits / 64];
-            for c in &ev_parsed {
-                for d in &c.0[p] {
+            for c in &dsl[p] {
+                for d in c.iter() {
                     let b = (mix(d.eid) >> shift) as usize;
                     let (w, m) = (b >> 6, 1u64 << (b & 63));
                     seen2[w] |= seen1[w] & m;
@@ -1459,8 +1748,8 @@ fn main() {
                 }
             }
             let mut v: Vec<D> = Vec::with_capacity(n / 8 + 16);
-            for c in &ev_parsed {
-                for d in &c.0[p] {
+            for c in &dsl[p] {
+                for d in c.iter() {
                     let b = (mix(d.eid) >> shift) as usize;
                     if seen2[b >> 6] & (1u64 << (b & 63)) != 0 {
                         v.push(*d);
@@ -1591,14 +1880,14 @@ fn main() {
             let np = counters[p].load(std::sync::atomic::Ordering::Relaxed) as usize;
             let mut names: Vec<&[u8]> = link_names[p].clone();
             names.resize(np, &[][..]);
-            for c in &ev_parsed {
-                for &(lid, off, len) in &c.2[p] {
-                    names[lid as usize] = &c.3[off as usize..(off + len) as usize];
+            for c in &ev_workers {
+                for &(lid, off, len) in &c.nparts[p] {
+                    names[lid as usize] = &c.arena[off as usize..(off + len) as usize];
                 }
             }
             let mut estart = vec![0u32; np + 1];
-            for c in &ev_parsed {
-                for e in &c.1[p] {
+            for c in &esl[p] {
+                for e in c.iter() {
                     if nl > 0 && is_loser(e.rowid) {
                         continue;
                     }
@@ -1611,8 +1900,8 @@ fn main() {
             let total = estart[np] as usize;
             let mut packed: Vec<u64> = vec![0; total];
             let mut pos: Vec<u32> = estart[..np].to_vec();
-            for c in &ev_parsed {
-                for e in &c.1[p] {
+            for c in &esl[p] {
+                for e in c.iter() {
                     if nl > 0 && is_loser(e.rowid) {
                         continue;
                     }
@@ -1833,7 +2122,9 @@ fn main() {
     lap!("written");
     // Skip freeing the big structures: the process is about to exit.
     std::mem::forget(results);
-    std::mem::forget(ev_parsed);
+    std::mem::forget(dsl);
+    std::mem::forget(esl);
+    std::mem::forget(ev_workers);
     std::mem::forget(losers);
     std::mem::forget(cl_parsed);
     std::process::exit(0);
