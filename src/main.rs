@@ -29,6 +29,7 @@ const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const CHUNK: usize = 4 << 20;
 const NPART: usize = 128;
+const BLK: usize = 128;
 
 const K_INVALID: u8 = 0;
 const K_VALID: u8 = 1;
@@ -263,6 +264,68 @@ fn split_fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> 
 
 const NLS: u64 = 0x0a0a_0a0a_0a0a_0a0a;
 
+/// Bit masks for 64 bytes at p: (commas, newlines, quotes), bit i = byte i.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let cm = _mm256_set1_epi8(b',' as i8);
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let qt = _mm256_set1_epi8(b'"' as i8);
+        let m = |x: __m256i, y: __m256i| -> u64 {
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32 as u64)
+        };
+        (
+            m(a, cm) | (m(b, cm) << 32),
+            m(a, nl) | (m(b, nl) << 32),
+            m(a, qt) | (m(b, qt) << 32),
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let v0 = vld1q_u8(p);
+        let v1 = vld1q_u8(p.add(16));
+        let v2 = vld1q_u8(p.add(32));
+        let v3 = vld1q_u8(p.add(48));
+        const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let w = vld1q_u8(W.as_ptr());
+        let mk = |c: u8| -> u64 {
+            let cc = vdupq_n_u8(c);
+            let m0 = vandq_u8(vceqq_u8(v0, cc), w);
+            let m1 = vandq_u8(vceqq_u8(v1, cc), w);
+            let m2 = vandq_u8(vceqq_u8(v2, cc), w);
+            let m3 = vandq_u8(vceqq_u8(v3, cc), w);
+            let s01 = vpaddq_u8(m0, m1);
+            let s23 = vpaddq_u8(m2, m3);
+            let s = vpaddq_u8(s01, s23);
+            let s = vpaddq_u8(s, s);
+            vgetq_lane_u64(vreinterpretq_u64_u8(s), 0)
+        };
+        (mk(b','), mk(b'\n'), mk(b'"'))
+    }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    let b = unsafe { std::slice::from_raw_parts(p, 64) };
+    let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+    for (i, &x) in b.iter().enumerate() {
+        c |= ((x == b',') as u64) << i;
+        n |= ((x == b'\n') as u64) << i;
+        q |= ((x == b'"') as u64) << i;
+    }
+    (c, n, q)
+}
+
 /// Tokenize a whole chunk in one pass: for every well-formed line with exactly N
 /// fields, call f with the unquoted fields. Malformed and empty lines are skipped.
 /// A line's quotes are valid exactly when every quote is part of a field wrapped
@@ -273,9 +336,8 @@ fn for_rows<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N
     let mut fields: [&'a [u8]; N] = [&[]; N];
     let mut n = 0usize;
     let mut field_start = 0usize;
-    let mut line_start = 0usize;
-    let mut q_total = 0u32; // quotes before the current word
-    let mut q_line = 0u32; // value of the running count at line start
+    let mut q_total = 0u32; // quotes before the current block
+    let mut q_line = 0u32; // running quote count at line start
 
     #[inline(always)]
     fn finish<'a, const N: usize>(fields: &mut [&'a [u8]; N], nq: u32) -> bool {
@@ -294,64 +356,46 @@ fn for_rows<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N
         wrapped == nq
     }
 
-    let mut i = 0usize;
-    while i + 8 <= len {
-        let w = ld8(chunk, i);
-        let qm = zero_bytes(w ^ QUOTES);
-        let mut m = zero_bytes(w ^ COMMAS) | zero_bytes(w ^ NLS);
+    let mut tail = [0u8; 64];
+    let mut base = 0usize;
+    while base < len {
+        let (cm, nl, qt) = if base + 64 <= len {
+            unsafe { masks64(chunk.as_ptr().add(base)) }
+        } else {
+            let r = len - base;
+            tail[..r].copy_from_slice(&chunk[base..]);
+            tail[r..].fill(0);
+            unsafe { masks64(tail.as_ptr()) }
+        };
+        let mut m = cm | nl;
         while m != 0 {
             let bit = m.trailing_zeros();
-            let pos = i + (bit >> 3) as usize;
-            if chunk[pos] == b',' {
+            let pos = base + bit as usize;
+            if (nl >> bit) & 1 == 0 {
                 if n < N {
-                    fields[n] = &chunk[field_start..pos];
+                    fields[n] = unsafe { chunk.get_unchecked(field_start..pos) };
                 }
                 n += 1;
                 field_start = pos + 1;
             } else {
-                let q_here = q_total + (qm & ((1u64 << bit) - 1)).count_ones();
+                let q_here = q_total + (qt & ((1u64 << bit) - 1)).count_ones();
                 if n + 1 == N {
-                    fields[n] = &chunk[field_start..pos];
+                    fields[n] = unsafe { chunk.get_unchecked(field_start..pos) };
                     if finish(&mut fields, q_here - q_line) {
                         f(&fields);
                     }
                 }
-                let _ = line_start;
                 n = 0;
                 field_start = pos + 1;
-                line_start = pos + 1;
                 q_line = q_here;
             }
             m &= m - 1;
         }
-        q_total += qm.count_ones();
-        i += 8;
+        q_total += qt.count_ones();
+        base += 64;
     }
-    while i < len {
-        let c = chunk[i];
-        if c == b',' {
-            if n < N {
-                fields[n] = &chunk[field_start..i];
-            }
-            n += 1;
-            field_start = i + 1;
-        } else if c == b'\n' {
-            if n + 1 == N {
-                fields[n] = &chunk[field_start..i];
-                if finish(&mut fields, q_total - q_line) {
-                    f(&fields);
-                }
-            }
-            n = 0;
-            field_start = i + 1;
-            line_start = i + 1;
-            q_line = q_total;
-        } else if c == b'"' {
-            q_total += 1;
-        }
-        i += 1;
-    }
-    if line_start < len && n + 1 == N {
+    // final line without a trailing newline
+    if field_start < len && n + 1 == N {
         fields[n] = &chunk[field_start..len];
         if finish(&mut fields, q_total - q_line) {
             f(&fields);
@@ -514,21 +558,18 @@ struct D {
 const NO_PART: u16 = u16::MAX;
 
 #[derive(Clone, Copy)]
-struct Ev<'a> {
-    pk: u128,
-    name: &'a [u8],
+struct Ev {
+    lid: u32, // person-local id within the partition
     ts: u32,
-    price: u32,
+    pc: u32, // price << 8 | category; 0 for views and carts
     rowid: u32,
-    cat: u8,
-    kind: u8,
 }
 
 #[derive(Clone, Copy)]
 struct Cl<'a> {
-    pk: u128,
-    cid: &'a [u8],
     ts: i64,
+    cid: &'a [u8],
+    lid: u32,
     camp: u16,
 }
 
@@ -666,6 +707,93 @@ impl PTable {
             h = (h + 1) & self.mask;
         }
     }
+}
+
+/// Second 64-bit hash of a key, independent of mix(); never 0.
+#[inline(always)]
+fn fp(k: u128) -> u64 {
+    fold((k as u64) ^ P3, ((k >> 64) as u64) ^ P1) | 1
+}
+
+/// Lock-free table: user-ID fingerprint -> person code (partition << 25 | local id).
+/// Filled with every linked ID before the events are read; unlinked users are
+/// added the first time a valid event names them.
+struct UserTable {
+    keys: Vec<std::sync::atomic::AtomicU64>,
+    vals: Vec<std::sync::atomic::AtomicU32>,
+    shift: u32,
+    mask: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+impl UserTable {
+    fn new(n: usize) -> Self {
+        let cap = (n + 1024).next_power_of_two();
+        // AtomicU64/U32 have the layout of u64/u32: allocate zeroed memory directly
+        let keys: Vec<std::sync::atomic::AtomicU64> = unsafe { std::mem::transmute(vec![0u64; cap]) };
+        let vals: Vec<std::sync::atomic::AtomicU32> = unsafe { std::mem::transmute(vec![0u32; cap]) };
+        UserTable { keys, vals, shift: 64 - cap.trailing_zeros(), mask: cap - 1, used: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    #[inline(always)]
+    fn val(&self, h: usize) -> u32 {
+        use std::sync::atomic::Ordering::Acquire;
+        loop {
+            let v = self.vals[h].load(Acquire);
+            if v != 0 {
+                return v - 1;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    #[inline(always)]
+    fn get(&self, f: u64) -> u32 {
+        use std::sync::atomic::Ordering::Acquire;
+        let mut h = (f >> self.shift) as usize;
+        loop {
+            let k = self.keys[h].load(Acquire);
+            if k == f {
+                return self.val(h);
+            }
+            if k == 0 {
+                return u32::MAX;
+            }
+            h = (h + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn get_or_insert(&self, f: u64, make: impl FnOnce() -> u32) -> u32 {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+        let mut h = (f >> self.shift) as usize;
+        loop {
+            let k = self.keys[h].load(Acquire);
+            if k == f {
+                return self.val(h);
+            }
+            if k == 0 {
+                match self.keys[h].compare_exchange(0, f, AcqRel, Acquire) {
+                    Ok(_) => {
+                        let v = make();
+                        self.vals[h].store(v + 1, Release);
+                        let u = self.used.fetch_add(1, Relaxed);
+                        assert!(u * 10 < self.mask * 9, "user table full");
+                        return v;
+                    }
+                    Err(cur) => {
+                        if cur == f {
+                            return self.val(h);
+                        }
+                    }
+                }
+            }
+            h = (h + 1) & self.mask;
+        }
+    }
+}
+
+const LID_BITS: u32 = 25;
+#[inline(always)]
+fn code(pp: usize, lid: u32) -> u32 {
+    ((pp as u32) << LID_BITS) | lid
 }
 
 struct Persons<'a> {
@@ -909,14 +1037,33 @@ fn main() {
             }
         }
     }
-    let person: Vec<(u128, &[u8])> = (0..n_ids)
-        .into_par_iter()
-        .map(|g| {
-            let (nm, k) = best[root[g] as usize];
-            (k, nm)
-        })
-        .collect();
-    let persons = Persons { shards: shards.into_iter().map(|s| s.tab).collect(), offs, person };
+
+    // every person gets (partition, local id); linked persons first, in root order
+    let counters: Vec<std::sync::atomic::AtomicU32> = (0..NPART).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+    let mut link_names: Vec<Vec<&[u8]>> = (0..NPART).map(|_| Vec::new()).collect();
+    let mut root_code: Vec<u32> = vec![u32::MAX; n_ids];
+    for g in 0..n_ids {
+        let r = root[g] as usize;
+        if root_code[r] == u32::MAX {
+            let (nm, k) = best[r];
+            let pp = part_of(k);
+            let lid = link_names[pp].len() as u32;
+            link_names[pp].push(nm);
+            root_code[r] = code(pp, lid);
+        }
+    }
+    for pp in 0..NPART {
+        counters[pp].store(link_names[pp].len() as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+    let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
+    let utab = UserTable::new(n_ids + ev_bytes / 1200 + 1024);
+    (0..NPART).into_par_iter().for_each(|s| {
+        for (l, &k) in shards[s].keys.iter().enumerate() {
+            let g = offs[s] as usize + l;
+            let c = root_code[root[g] as usize];
+            utab.get_or_insert(fp(k), || c);
+        }
+    });
     lap!(format!("links: {} ids", n_ids));
 
     // ---------------- events: parse (valid rows go straight to their person partition)
@@ -926,16 +1073,52 @@ fn main() {
     }
     assert!(ev_chunks.len() < 4096);
     let products = &products;
-    let persons = &persons;
-    let ev_parsed: Vec<(Vec<Vec<D>>, Vec<Vec<Ev>>)> = ev_chunks
+    let utab = &utab;
+    let counters = &counters[..];
+    #[inline(always)]
+    fn flush_rows<'a>(
+        rows: &mut Vec<Row<'a>>,
+        utab: &UserTable,
+        counters: &[std::sync::atomic::AtomicU32],
+        dparts: &mut [Vec<D>],
+        eparts: &mut [Vec<Ev>],
+        nparts: &mut [Vec<(u32, &'a [u8])>],
+    ) {
+        let mut cd = [u32::MAX; BLK];
+        for (i, r) in rows.iter().enumerate() {
+            if r.kind != K_INVALID {
+                cd[i] = utab.get_or_insert(fp(r.ukey), || {
+                    // a user seen for the first time and not linked: a person of their own
+                    let pp = part_of(r.ukey);
+                    let lid = counters[pp].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    nparts[pp].push((lid, r.user));
+                    code(pp, lid)
+                });
+            }
+        }
+        for (i, r) in rows.iter().enumerate() {
+            let mut ppart = NO_PART;
+            if r.kind != K_INVALID {
+                let pp = (cd[i] >> LID_BITS) as usize;
+                let lid = cd[i] & ((1 << LID_BITS) - 1);
+                ppart = pp as u16;
+                eparts[pp].push(Ev { lid, ts: r.ts, pc: (r.price << 8) | r.cat as u32, rowid: r.rowid });
+            }
+            dparts[part_of(r.eid)].push(D { eid: r.eid, ingest: r.ingest, rowid: r.rowid, ppart });
+        }
+        rows.clear();
+    }
+    type EvOut<'a> = (Vec<Vec<D>>, Vec<Vec<Ev>>, Vec<Vec<(u32, &'a [u8])>>);
+    let ev_parsed: Vec<EvOut> = ev_chunks
         .par_iter()
         .enumerate()
         .map(|(ci, c)| {
             let mut dparts: Vec<Vec<D>> = new_parts(c.len(), 70);
             let mut eparts: Vec<Vec<Ev>> = new_parts(c.len(), 70);
+            let mut nparts: Vec<Vec<(u32, &[u8])>> = (0..NPART).map(|_| Vec::new()).collect();
             let mut li: u32 = 0;
             let base = (ci as u32) << 20;
-            let mut rows: Vec<Row> = Vec::with_capacity(c.len() / 70 + 16);
+            let mut rows: Vec<Row> = Vec::with_capacity(BLK);
             for_rows(c, |f: &[&[u8]; 7]| {
                 if f[0].is_empty() {
                     return;
@@ -977,21 +1160,13 @@ fn main() {
                     }
                 }
                 rows.push(Row { ukey, eid: key128(f[0]), user, ingest, ts, price, rowid, cat, kind });
-            });
-            // batched link lookups: a tight loop lets the CPU overlap the cache misses
-            let idx: Vec<u32> = rows.iter().map(|r| if r.kind != K_INVALID { persons.lookup(r.ukey) } else { u32::MAX }).collect();
-            for (r, &ix) in rows.iter().zip(idx.iter()) {
-                let mut ppart = NO_PART;
-                if r.kind != K_INVALID {
-                    let (pk, name) = persons.of(r.ukey, r.user, ix);
-                    let pp = part_of(pk);
-                    ppart = pp as u16;
-                    eparts[pp].push(Ev { pk, name, ts: r.ts, price: r.price, rowid: r.rowid, cat: r.cat, kind: r.kind });
+                if rows.len() == BLK {
+                    flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts);
                 }
-                dparts[part_of(r.eid)].push(D { eid: r.eid, ingest: r.ingest, rowid: r.rowid, ppart });
-            }
+            });
+            flush_rows(&mut rows, utab, counters, &mut dparts, &mut eparts, &mut nparts);
             assert!(li < (1 << 20));
-            (dparts, eparts)
+            (dparts, eparts, nparts)
         })
         .collect();
     lap!(format!("events parsed: {} chunks", ev_chunks.len()));
@@ -1041,6 +1216,7 @@ fn main() {
             out
         })
         .collect();
+    lap!(format!("user table: {} used of {}", utab.used.load(std::sync::atomic::Ordering::Relaxed), utab.mask + 1));
     lap!("events deduped");
 
     // ---------------- clicks
@@ -1068,10 +1244,13 @@ fn main() {
                 };
                 rows.push((key128(f[1]), f[0], ts, camp));
             });
-            let idx: Vec<u32> = rows.iter().map(|r| persons.lookup(r.0)).collect();
-            for (r, &ix) in rows.iter().zip(idx.iter()) {
-                let pk = if ix == u32::MAX { r.0 } else { persons.person[ix as usize].0 };
-                parts[part_of(pk)].push(Cl { pk, cid: r.1, ts: r.2, camp: r.3 });
+            // a click whose user never had a valid event cannot credit anything: drop it
+            let cds: Vec<u32> = rows.iter().map(|r| utab.get(fp(r.0))).collect();
+            for (r, &cd) in rows.iter().zip(cds.iter()) {
+                if cd != u32::MAX {
+                    let pp = (cd >> LID_BITS) as usize;
+                    parts[pp].push(Cl { ts: r.2, cid: r.1, lid: cd & ((1 << LID_BITS) - 1), camp: r.3 });
+                }
             }
             parts
         })
@@ -1114,78 +1293,55 @@ fn main() {
                 }
             };
 
-            // pass 1: person-local ids and counts
-            let n: usize = ev_parsed.iter().map(|c| c.1[p].len()).sum();
-            let mut tab = PTable::new(n / 16 + 64);
-            let mut lids: Vec<u32> = Vec::with_capacity(n);
-            let mut counts: Vec<u32> = Vec::with_capacity(n / 16 + 64);
-            let mut pnames: Vec<&[u8]> = Vec::with_capacity(n / 16 + 64);
+            // person-local ids are dense: group by counting sort, no hash tables
+            let np = counters[p].load(std::sync::atomic::Ordering::Relaxed) as usize;
+            let mut names: Vec<&[u8]> = link_names[p].clone();
+            names.resize(np, &[][..]);
+            for c in &ev_parsed {
+                for &(lid, nm) in &c.2[p] {
+                    names[lid as usize] = nm;
+                }
+            }
+            let mut estart = vec![0u32; np + 1];
             for c in &ev_parsed {
                 for e in &c.1[p] {
                     if nl > 0 && is_loser(e.rowid) {
-                        lids.push(u32::MAX);
                         continue;
                     }
-                    let lid = tab.get_or_insert(e.pk, || {
-                        counts.push(0);
-                        pnames.push(e.name);
-                        (counts.len() - 1) as u32
-                    });
-                    counts[lid as usize] += 1;
-                    lids.push(lid);
+                    estart[e.lid as usize + 1] += 1;
                 }
             }
-            let np = counts.len();
-            let mut estart = vec![0u32; np + 1];
             for l in 0..np {
-                estart[l + 1] = estart[l] + counts[l];
+                estart[l + 1] += estart[l];
             }
-            // pass 2: scatter packed events (ts << 32 | price << 8 | cat) by person
             let total = estart[np] as usize;
             let mut packed: Vec<u64> = vec![0; total];
             let mut pos: Vec<u32> = estart[..np].to_vec();
-            let mut li = 0usize;
             for c in &ev_parsed {
                 for e in &c.1[p] {
-                    let lid = lids[li];
-                    li += 1;
-                    if lid == u32::MAX {
+                    if nl > 0 && is_loser(e.rowid) {
                         continue;
                     }
-                    let at = pos[lid as usize];
-                    pos[lid as usize] = at + 1;
-                    packed[at as usize] = ((e.ts as u64) << 32) | ((e.price as u64) << 8) | e.cat as u64;
-                }
-            }
-            // clicks: same grouping; clicks of people with no events are dropped
-            let mut ccount = vec![0u32; np + 1];
-            let ncl: usize = cl_parsed.iter().map(|c| c[p].len()).sum();
-            let mut clids: Vec<u32> = Vec::with_capacity(ncl);
-            for c in &cl_parsed {
-                for x in &c[p] {
-                    let lid = tab.get(x.pk);
-                    clids.push(lid);
-                    if lid != u32::MAX {
-                        ccount[lid as usize] += 1;
-                    }
+                    let at = pos[e.lid as usize];
+                    pos[e.lid as usize] = at + 1;
+                    packed[at as usize] = ((e.ts as u64) << 32) | e.pc as u64;
                 }
             }
             let mut cstart = vec![0u32; np + 1];
+            for c in &cl_parsed {
+                for x in &c[p] {
+                    cstart[x.lid as usize + 1] += 1;
+                }
+            }
             for l in 0..np {
-                cstart[l + 1] = cstart[l] + ccount[l];
+                cstart[l + 1] += cstart[l];
             }
             let mut carr: Vec<(i64, &[u8], u16)> = vec![(0, &[][..], 0); cstart[np] as usize];
             let mut cpos: Vec<u32> = cstart[..np].to_vec();
-            let mut li = 0usize;
             for c in &cl_parsed {
                 for x in &c[p] {
-                    let lid = clids[li];
-                    li += 1;
-                    if lid == u32::MAX {
-                        continue;
-                    }
-                    let at = cpos[lid as usize];
-                    cpos[lid as usize] = at + 1;
+                    let at = cpos[x.lid as usize];
+                    cpos[x.lid as usize] = at + 1;
                     carr[at as usize] = (x.ts, x.cid, x.camp);
                 }
             }
@@ -1219,7 +1375,10 @@ fn main() {
             };
 
             for lid in 0..np {
-                let name = pnames[lid];
+                if estart[lid] == estart[lid + 1] {
+                    continue; // a linked person with no surviving events
+                }
+                let name = names[lid];
                 let pe = &mut packed[estart[lid] as usize..estart[lid + 1] as usize];
                 if pe.len() > 1 {
                     pe.sort_unstable();
@@ -1433,7 +1592,23 @@ fn write_user_daily(path: &Path, rows: &[&URow], cats: &[&[u8]]) {
     let f = std::io::BufWriter::with_capacity(1 << 20, File::create(path).unwrap());
     let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
     let mut rg = w.next_row_group().unwrap();
-    let ids: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.name.to_vec())).collect();
+    // all names in one buffer, then zero-copy slices of it
+    let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 12);
+    let mut ends: Vec<usize> = Vec::with_capacity(rows.len());
+    for r in rows {
+        buf.extend_from_slice(r.name);
+        ends.push(buf.len());
+    }
+    let buf = bytes::Bytes::from(buf);
+    let mut st = 0;
+    let ids: Vec<ByteArray> = ends
+        .iter()
+        .map(|&e| {
+            let b = ByteArray::from(buf.slice(st..e));
+            st = e;
+            b
+        })
+        .collect();
     col!(rg, ByteArrayType, &ids, None);
     let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
     col!(rg, Int32Type, &days, None);
@@ -1444,7 +1619,8 @@ fn write_user_daily(path: &Path, rows: &[&URow], cats: &[&[u8]]) {
     let v: Vec<i64> = rows.iter().map(|r| r.revenue).collect();
     col!(rg, Int64Type, &v, None);
     let def: Vec<i16> = rows.iter().map(|r| r.top.is_some() as i16).collect();
-    let tops: Vec<ByteArray> = rows.iter().filter_map(|r| r.top.map(|c| ByteArray::from(cats[c as usize].to_vec()))).collect();
+    let catb: Vec<ByteArray> = cats.iter().map(|c| ByteArray::from(c.to_vec())).collect();
+    let tops: Vec<ByteArray> = rows.iter().filter_map(|r| r.top.map(|c| catb[c as usize].clone())).collect();
     col!(rg, ByteArrayType, &tops, Some(&def));
     rg.close().unwrap();
     w.close().unwrap();
