@@ -1,0 +1,4 @@
+# Grading harness (scripts/run_fixtures.py, scripts/compare.py) and the
+# vectorised pipeline. Pure-Python stages need nothing beyond the stdlib.
+polars>=1.0
+pyarrow>=16.0

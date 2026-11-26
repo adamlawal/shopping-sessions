@@ -1,9 +1,21 @@
+# Datasets, starter kits and run outputs (kept locally, never committed)
+dev/
+dev-answer/
+out/
+output/
+generator/
+starter-duckdb/
+
+# Rust build artifacts (from the rust-pipeline branch, when checked out here)
 target/
 generator/target/
-dev/
-out/
+
+# Python
 .venv/
-starter-duckdb/
+venv/
 __pycache__/
-dev-answer/
-generator/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
